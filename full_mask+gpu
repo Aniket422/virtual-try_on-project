@@ -1,0 +1,231 @@
+import streamlit as st
+import cv2
+import numpy as np
+from ultralytics import YOLO
+import tempfile
+from collections import Counter
+from segment_anything import sam_model_registry, SamPredictor
+
+st.set_page_config(page_title="Clothing Segmentor", page_icon="👕")
+
+st.title("👕 Clothing Item Segmentor")
+st.write("This model outlines each clothing item with colored masks!")
+
+# Download the segmentation model
+@st.cache_resource
+def load_model():
+    import os
+    import urllib.request
+    from ultralytics import YOLO
+
+    model_path = "deepfashion2_yolov8s-seg.pt"
+
+    if not os.path.exists(model_path):
+        with st.spinner("Downloading model..."):
+            urllib.request.urlretrieve(
+                "https://huggingface.co/Bingsu/adetailer/resolve/main/deepfashion2_yolov8s-seg.pt",
+                model_path
+            )
+
+    model = YOLO(model_path)
+
+    return model
+
+# Load model
+model = load_model()
+
+# Clothing categories from DeepFashion2
+clothing_categories = {
+    0: 'short_sleeved_shirt',
+    1: 'long_sleeved_shirt',
+    2: 'short_sleeved_outwear',
+    3: 'long_sleeved_outwear',
+    4: 'vest',
+    5: 'sling',
+    6: 'shorts',
+    7: 'trousers',
+    8: 'skirt',
+    9: 'short_sleeved_dress',
+    10: 'long_sleeved_dress',
+    11: 'vest_dress',
+    12: 'sling_dress'
+}
+
+# Colors for each clothing type
+colors = {
+    'short_sleeved_shirt': (255, 0, 0),      # Blue
+    'long_sleeved_shirt': (0, 0, 255),        # Red
+    'short_sleeved_outwear': (255, 165, 0),   # Orange
+    'long_sleeved_outwear': (255, 255, 0),    # Yellow
+    'vest': (128, 0, 128),                    # Purple
+    'sling': (255, 192, 203),                  # Pink
+    'shorts': (0, 255, 0),                     # Green
+    'trousers': (0, 128, 0),                   # Dark Green
+    'skirt': (255, 20, 147),                   # Deep Pink
+    'short_sleeved_dress': (75, 0, 130),       # Indigo
+    'long_sleeved_dress': (138, 43, 226),      # Blue Violet
+    'vest_dress': (255, 105, 180),             # Hot Pink
+    'sling_dress': (255, 182, 193)              # Light Pink
+}
+
+sam = sam_model_registry["vit_b"](checkpoint="sam_vit_b.pth")
+sam.to("cuda")   # or "cuda" if GPU
+predictor = SamPredictor(sam)
+
+
+uploaded_file = st.file_uploader("Upload a video", type=['mp4', 'avi', 'mov', 'mkv'])
+
+if uploaded_file and st.button("🔍 Segment Clothing Items", type="primary"):
+    # Save uploaded file
+    tfile = tempfile.NamedTemporaryFile(delete=False, suffix='.mp4')
+    tfile.write(uploaded_file.read())
+    input_path = tfile.name
+    
+    # Output path
+    output_path = tempfile.NamedTemporaryFile(delete=False, suffix='.mp4').name
+    
+    # Open video
+    cap = cv2.VideoCapture(input_path)
+    fps = int(cap.get(cv2.CAP_PROP_FPS))
+    width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    
+    # Video writer
+    fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+    out = cv2.VideoWriter(output_path, fourcc, fps, (width, height))
+    
+    # Progress
+    progress_bar = st.progress(0)
+    status_text = st.empty()
+    
+    frame_count = 0
+    all_detections = []
+    last_mask = None
+
+
+    while True:
+        ret, frame = cap.read()
+        if not ret:
+            break
+        
+        # Run segmentation
+        results = model(frame, conf=0.5, iou=0.5)
+
+        combined_mask = np.zeros((height, width), dtype=np.uint8)
+        
+        # Create overlay for masks
+        overlay = frame.copy()
+
+        
+        
+        # Process results
+        if results[0].masks is not None:
+            masks = results[0].masks.data.cpu().numpy()
+            boxes = results[0].boxes
+            
+            for i, (mask, box) in enumerate(zip(masks, boxes)):
+                # Get class and confidence
+                cls = int(box.cls[0])
+                conf = float(box.conf[0])
+
+                if conf < 0.5:
+                    continue
+
+                clothing_type = clothing_categories.get(cls, "unknown")
+
+                # --- CLEAN MASK PIPELINE ---
+
+                
+                frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                predictor.set_image(frame_rgb)
+
+                x1, y1, x2, y2 = map(int, box.xyxy[0])
+                input_box = np.array([x1, y1, x2, y2])
+
+                masks_sam, _, _ = predictor.predict(
+                box=input_box,
+                multimask_output=False
+                )
+
+                mask = masks_sam[0].astype(np.uint8)
+
+                # store last good mask
+                last_mask = mask
+
+                # Convert to binary mask
+                mask = (mask > 0.5).astype(np.uint8)
+
+                # Light cleanup (only ONE operation)
+                kernel = np.ones((3,3), np.uint8)
+                mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
+
+                # --- COLOR MASK ---
+                color = colors.get(clothing_type, (128, 128, 128))
+
+                combined_mask = np.maximum(combined_mask, mask)
+
+                # --- LABEL ---
+                x1, y1, x2, y2 = map(int, box.xyxy[0])
+                cv2.putText(
+                    overlay,
+                    f"{clothing_type}: {conf:.2f}",
+                    (x1, y1-10),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.5,
+                    color,
+                    2
+                )
+
+                all_detections.append(clothing_type)
+        
+        bw_mask = (combined_mask * 255).astype(np.uint8)
+        overlay = cv2.cvtColor(bw_mask, cv2.COLOR_GRAY2BGR)
+        # Write frame
+        out.write(overlay)
+
+        combined_mask = np.maximum(combined_mask, mask)
+        
+        # Update progress
+        frame_count += 1
+        progress = frame_count / total_frames
+        progress_bar.progress(progress)
+        status_text.text(f"Processing frame {frame_count}/{total_frames}")
+    
+    bw_mask = (combined_mask * 255).astype(np.uint8)
+    overlay = cv2.cvtColor(bw_mask, cv2.COLOR_GRAY2BGR)
+    # Clean up
+    cap.release()
+    out.release()
+    
+    # Clear progress
+    progress_bar.empty()
+    status_text.empty()
+    
+    st.success("✅ Processing complete!")
+    
+    # Download button
+    with open(output_path, 'rb') as f:
+        video_data = f.read()
+        st.download_button(
+            label="📥 DOWNLOAD SEGMENTED VIDEO",
+            data=video_data,
+            file_name="clothing_segmented.mp4",
+            mime="video/mp4",
+            use_container_width=True
+        )
+    
+    # Show statistics
+    if all_detections:
+        st.subheader("📊 Clothing Items Detected")
+        counts = Counter(all_detections)
+        
+        # Display in columns
+        cols = st.columns(3)
+        for i, (item, count) in enumerate(counts.most_common(6)):
+            with cols[i % 3]:
+                # Get color for this item
+                color = colors.get(item, (128,128,128))
+                color_hex = '#{:02x}{:02x}{:02x}'.format(color[0], color[1], color[2])
+                st.markdown(f"<span style='color:{color_hex}'>●</span> **{item}**: {count}", 
+                          unsafe_allow_html=True)
