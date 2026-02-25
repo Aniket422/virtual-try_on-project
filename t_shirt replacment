@@ -1,0 +1,204 @@
+import streamlit as st
+import cv2
+import numpy as np
+import tempfile
+import os
+import urllib.request
+import torch
+from ultralytics import YOLO
+from segment_anything import sam_model_registry, SamPredictor
+
+# --------------------------------------------------
+# DEVICE SETUP
+# --------------------------------------------------
+DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+
+st.set_page_config(page_title="Clothing Replacement", page_icon="👕")
+st.title("👕 AI Clothing Replacement (YOLO + SAM)")
+st.write(f"Running on: **{DEVICE.upper()}**")
+
+# --------------------------------------------------
+# LOAD YOLO MODEL
+# --------------------------------------------------
+@st.cache_resource
+def load_yolo():
+
+    model_path = "deepfashion2_yolov8s-seg.pt"
+
+    if not os.path.exists(model_path):
+        st.info("Downloading clothing detection model...")
+        urllib.request.urlretrieve(
+            "https://huggingface.co/Bingsu/adetailer/resolve/main/deepfashion2_yolov8s-seg.pt",
+            model_path
+        )
+
+    model = YOLO(model_path)
+    model.to(DEVICE)
+
+    return model
+
+
+# --------------------------------------------------
+# LOAD SAM MODEL
+# --------------------------------------------------
+@st.cache_resource
+def load_sam():
+
+    checkpoint = "sam_vit_b_01ec64.pth"
+
+    if not os.path.exists(checkpoint):
+        st.error(
+            "Download SAM model first:\n"
+            "https://dl.fbaipublicfiles.com/segment_anything/sam_vit_b_01ec64.pth"
+        )
+        st.stop()
+
+    sam = sam_model_registry["vit_b"](checkpoint=checkpoint)
+    sam.to(device=DEVICE)
+
+    return SamPredictor(sam)
+
+
+model = load_yolo()
+predictor = load_sam()
+
+# --------------------------------------------------
+# CLOTHING LABELS
+# --------------------------------------------------
+clothing_categories = {
+    0:'short_sleeved_shirt',
+    1:'long_sleeved_shirt',
+    6:'shorts',
+    7:'trousers',
+    8:'skirt'
+}
+
+# ONLY replace upper clothes
+TARGET_CLOTHES = [
+    "short_sleeved_shirt",
+    "long_sleeved_shirt"
+]
+
+# --------------------------------------------------
+# UI INPUTS
+# --------------------------------------------------
+video_file = st.file_uploader("Upload Person Video", type=["mp4","avi","mov"])
+cloth_image_file = st.file_uploader("Upload Replacement Cloth Image", type=["png","jpg","jpeg"])
+
+# --------------------------------------------------
+# PROCESS
+# --------------------------------------------------
+if video_file and cloth_image_file and st.button("🚀 Start Replacement"):
+
+    # Save video
+    tfile = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4")
+    tfile.write(video_file.read())
+    input_path = tfile.name
+
+    # Load replacement cloth
+    file_bytes = np.asarray(bytearray(cloth_image_file.read()), dtype=np.uint8)
+    replace_img = cv2.imdecode(file_bytes, cv2.IMREAD_COLOR)
+
+    cap = cv2.VideoCapture(input_path)
+
+    width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    fps = int(cap.get(cv2.CAP_PROP_FPS))
+    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+
+    output_path = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4").name
+    out = cv2.VideoWriter(
+        output_path,
+        cv2.VideoWriter_fourcc(*"mp4v"),
+        fps,
+        (width, height)
+    )
+
+    progress = st.progress(0)
+    frame_id = 0
+
+    # --------------------------------------------------
+    # FRAME LOOP
+    # --------------------------------------------------
+    while True:
+        ret, frame = cap.read()
+        if not ret:
+            break
+
+        output = frame.copy()
+
+        # YOLO detection
+        results = model(frame, device=DEVICE)
+
+        # SAM needs RGB
+        predictor.set_image(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
+
+        if results[0].boxes is not None:
+
+            for box in results[0].boxes:
+
+                cls = int(box.cls[0])
+                conf = float(box.conf[0])
+
+                cloth_type = clothing_categories.get(cls, "unknown")
+
+                # ONLY shirts
+                if cloth_type not in TARGET_CLOTHES:
+                    continue
+
+                x1, y1, x2, y2 = map(int, box.xyxy[0])
+                input_box = np.array([x1, y1, x2, y2])
+
+                # -------- SAM MASK --------
+                masks, _, _ = predictor.predict(
+                    box=input_box,
+                    multimask_output=False
+                )
+
+                mask = masks[0].astype(np.float32)
+
+                # ⭐ FIX SIZE ERROR
+                mask = cv2.resize(
+                    mask,
+                    (width, height),
+                    interpolation=cv2.INTER_NEAREST
+                )
+
+                mask = (mask > 0.5).astype(np.float32)
+                mask3 = np.stack([mask]*3, axis=-1)
+
+                # -------- REPLACE ONLY INSIDE BOX --------
+                box_w = x2 - x1
+                box_h = y2 - y1
+
+                replace_resized = cv2.resize(replace_img, (box_w, box_h))
+
+                cloth_layer = np.zeros_like(frame)
+                cloth_layer[y1:y2, x1:x2] = replace_resized
+
+                # Blend
+                output = (
+                    output * (1 - mask3) +
+                    cloth_layer * mask3
+                ).astype(np.uint8)
+
+        out.write(output)
+
+        frame_id += 1
+        progress.progress(frame_id / total_frames)
+
+    cap.release()
+    out.release()
+
+    st.success("✅ Clothing Replacement Complete!")
+
+    with open(output_path, "rb") as f:
+        st.download_button(
+            "📥 Download Result",
+            f.read(),
+            "cloth_replaced.mp4",
+            mime="video/mp4"
+        )
+
+
+
