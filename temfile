@@ -1,0 +1,400 @@
+import streamlit as st
+import cv2
+import numpy as np
+from ultralytics import YOLO
+import tempfile
+from segment_anything import sam_model_registry, SamPredictor
+import torch
+from PIL import Image
+import math
+
+# ─────────────────────────────────────────────
+#  PAGE CONFIG
+# ─────────────────────────────────────────────
+st.set_page_config(
+    page_title="360° Cloth Transfer",
+    page_icon="👕",
+    layout="wide"
+)
+
+# ─────────────────────────────────────────────
+#  CUSTOM CSS
+# ─────────────────────────────────────────────
+st.markdown("""
+<style>
+  body { background: #0f0f0f; }
+  .main { background: #0f0f0f; }
+  .stApp { background: linear-gradient(135deg,#0f0f0f 0%,#1a1a2e 100%); }
+  h1 { 
+    font-family: 'Courier New', monospace;
+    background: linear-gradient(90deg,#00d4ff,#7b2ff7);
+    -webkit-background-clip: text; -webkit-text-fill-color: transparent;
+    font-size: 2.4rem; letter-spacing: 2px;
+  }
+  .info-box {
+    background: rgba(0,212,255,0.08);
+    border: 1px solid rgba(0,212,255,0.3);
+    border-radius: 10px; padding: 16px; margin: 12px 0;
+    font-family: monospace; color: #00d4ff; font-size: 0.85rem;
+  }
+  .angle-indicator {
+    background: rgba(123,47,247,0.15);
+    border: 1px solid rgba(123,47,247,0.4);
+    border-radius: 8px; padding: 10px; text-align: center;
+    font-family: monospace; color: #c084fc; font-size: 1rem;
+  }
+  .stProgress > div > div { background: linear-gradient(90deg,#00d4ff,#7b2ff7) !important; }
+</style>
+""", unsafe_allow_html=True)
+
+st.markdown("# 👕 360° Angle-Aware Clothing Transfer")
+st.markdown("""
+<div class='info-box'>
+  ● Upload a <b>product sheet</b> with 4 views: front-left · side · back · side-right<br>
+  ● The app auto-detects person orientation (−45° → 0° → +45°) and picks the correct shirt view<br>
+  ● Uses YOLO-seg + SAM for pixel-perfect segmentation with sharp edges
+</div>
+""", unsafe_allow_html=True)
+
+# ─────────────────────────────────────────────
+#  LOAD MODELS
+# ─────────────────────────────────────────────
+@st.cache_resource
+def load_models():
+    model = YOLO("deepfashion2_yolov8s-seg.pt")
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    sam = sam_model_registry["vit_b"](checkpoint="sam_vit_b_01ec64.pth")
+    sam.to(device)
+    predictor = SamPredictor(sam)
+    return model, predictor, device
+
+try:
+    model, predictor, device = load_models()
+    st.success(f"✅ Models loaded — running on **{device.upper()}**")
+except Exception as e:
+    st.error(f"⚠️ Model load failed: {e}")
+    st.stop()
+
+# ─────────────────────────────────────────────
+#  HELPERS
+# ─────────────────────────────────────────────
+
+def extract_cloth_region(img_bgr: np.ndarray, mask: np.ndarray, box_xyxy) -> np.ndarray:
+    """Crop shirt from source image using mask + bounding box, inpaint holes."""
+    x1, y1, x2, y2 = map(int, box_xyxy)
+    cloth = img_bgr.copy()
+    cloth[mask == 0] = 0
+    crop = cloth[y1:y2, x1:x2]
+    if crop.size == 0:
+        return None
+    hole_mask = (crop.sum(axis=-1) == 0).astype(np.uint8) * 255
+    crop = cv2.inpaint(crop, hole_mask, 3, cv2.INPAINT_TELEA)
+    return crop
+
+
+def estimate_body_angle(box_xyxy, frame_w: int) -> float:
+    """
+    Estimate rough horizontal orientation from bounding-box position & aspect.
+    Returns angle in degrees:
+      0   = facing camera (front view)
+     -45  = turned left  (show left-side view)
+     +45  = turned right (show right-side view)
+    """
+    x1, y1, x2, y2 = box_xyxy
+    cx = (x1 + x2) / 2
+    w  = x2 - x1
+    h  = y2 - y1
+    aspect = w / max(h, 1)          # narrow → side-on; wide → frontal
+
+    # Map aspect ratio: ~0.35 side-on → ±45°; ~0.55 frontal → 0°
+    # Normalise to [-45, 45] based on aspect
+    angle_from_aspect = (0.55 - aspect) / 0.20 * 45.0
+    angle_from_aspect = float(np.clip(angle_from_aspect, -45, 45))
+
+    # Use horizontal position to decide left vs right lean
+    rel_x = (cx / frame_w) - 0.5    # -0.5 left ... +0.5 right
+    angle = angle_from_aspect * np.sign(rel_x) if abs(rel_x) > 0.1 else angle_from_aspect
+    return float(angle)
+
+
+def angle_to_view_index(angle_deg: float) -> int:
+    """
+    Map body angle to one of 4 shirt-view slots:
+      0 = front   ( -15° .. +15°  )
+      1 = left-side ( < -15° )
+      2 = back    ( extreme — not typical in video; fallback )
+      3 = right-side ( > +15° )
+    Returns index 0-3 matching the 4 crops you extracted.
+    """
+    if angle_deg < -15:
+        return 1   # left / side-left
+    elif angle_deg > 15:
+        return 3   # right / side-right
+    else:
+        return 0   # front
+
+
+def split_product_sheet(img_bgr: np.ndarray, n_views: int = 4):
+    """Split a horizontally-arranged product sheet into N equal vertical strips."""
+    h, w = img_bgr.shape[:2]
+    strip_w = w // n_views
+    views = []
+    for i in range(n_views):
+        crop = img_bgr[:, i * strip_w : (i + 1) * strip_w]
+        views.append(crop)
+    return views   # [front-left, side-left, back, side-right]  (typical layout)
+
+
+def apply_shirt_to_frame(
+    frame: np.ndarray,
+    predictor,
+    model,
+    shirt_views: list,
+    conf: float = 0.45,
+) -> tuple:
+    """Run detection + SAM on one frame, pick angle-correct shirt, blend."""
+    output = frame.copy()
+    used_angle = 0.0
+    used_view_idx = 0
+    frame_h, frame_w = frame.shape[:2]
+
+    results = model(frame, conf=conf, verbose=False)
+    if results[0].boxes is None:
+        return output, used_angle, used_view_idx
+
+    frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+    predictor.set_image(frame_rgb)
+
+    for box in results[0].boxes:
+        cls = int(box.cls[0])
+        if cls not in [0, 1]:          # 0=short-sleeve, 1=long-sleeve
+            continue
+
+        x1, y1, x2, y2 = map(int, box.xyxy[0])
+        input_box = np.array([x1, y1, x2, y2])
+
+        masks_sam, _, _ = predictor.predict(
+            box=input_box,
+            multimask_output=False
+        )
+        mask = (masks_sam[0] > 0.5).astype(np.uint8) * 255
+
+        # Morphological cleanup for sharp edges
+        k5 = np.ones((5, 5), np.uint8)
+        k3 = np.ones((3, 3), np.uint8)
+        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, k5)
+        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN,  k3)
+
+        # Angle → view
+        used_angle = estimate_body_angle((x1, y1, x2, y2), frame_w)
+        used_view_idx = angle_to_view_index(used_angle)
+        source_cloth = shirt_views[used_view_idx]
+
+        bw = x2 - x1
+        bh = y2 - y1
+        if bw <= 0 or bh <= 0:
+            continue
+
+        cloth_resized  = cv2.resize(source_cloth, (bw, bh))
+        mask_crop      = mask[y1:y2, x1:x2]
+        mask_crop      = cv2.resize(mask_crop, (bw, bh), interpolation=cv2.INTER_NEAREST)
+
+        # Alpha blend
+        alpha = mask_crop.astype(np.float32) / 255.0
+        alpha = alpha[..., np.newaxis]
+        roi   = output[y1:y2, x1:x2]
+        blended = (roi * (1 - alpha) + cloth_resized * alpha).astype(np.uint8)
+        output[y1:y2, x1:x2] = blended
+        break   # one person per frame assumed
+
+    return output, used_angle, used_view_idx
+
+
+# ─────────────────────────────────────────────
+#  UI  COLUMNS
+# ─────────────────────────────────────────────
+col_left, col_right = st.columns([1, 1], gap="large")
+
+with col_left:
+    st.subheader("📸 Product Sheet (4-view)")
+    st.caption("Upload the horizontal product image showing: front · side · back · side")
+    source_file = st.file_uploader("Product Image", type=["jpg", "jpeg", "png"], key="src")
+
+with col_right:
+    st.subheader("🎬 Video")
+    st.caption("Upload the video of the person to transfer the shirt onto")
+    video_file = st.file_uploader("Video File", type=["mp4", "mov", "avi"], key="vid")
+
+# ─────────────────────────────────────────────
+#  EXTRACT SHIRT VIEWS FROM PRODUCT SHEET
+# ─────────────────────────────────────────────
+shirt_views = []
+
+if source_file:
+    file_bytes = np.asarray(bytearray(source_file.read()), dtype=np.uint8)
+    product_img = cv2.imdecode(file_bytes, cv2.IMREAD_COLOR)
+
+    # Show uploaded product
+    st.image(cv2.cvtColor(product_img, cv2.COLOR_BGR2RGB),
+             caption="Uploaded product sheet", use_column_width=True)
+
+    # Split into 4 views
+    raw_views = split_product_sheet(product_img, n_views=4)
+    view_labels = ["Front", "Left Side", "Back", "Right Side"]
+
+    st.markdown("### Detected views")
+    vcols = st.columns(4)
+    for i, (v, lbl) in enumerate(zip(raw_views, view_labels)):
+        with vcols[i]:
+            st.image(cv2.cvtColor(v, cv2.COLOR_BGR2RGB), caption=lbl, use_column_width=True)
+
+    # Extract shirt from each view using YOLO
+    for i, view in enumerate(raw_views):
+        results_src = model(view, conf=0.4, verbose=False)
+        extracted = None
+        if results_src[0].masks is not None:
+            for mask_data, box in zip(
+                results_src[0].masks.data.cpu().numpy(),
+                results_src[0].boxes
+            ):
+                cls = int(box.cls[0])
+                if cls not in [0, 1]:
+                    continue
+                m = (mask_data > 0.5).astype(np.uint8)
+                m = cv2.resize(m, (view.shape[1], view.shape[0]),
+                               interpolation=cv2.INTER_NEAREST)
+                extracted = extract_cloth_region(view, m, box.xyxy[0].cpu().numpy())
+                if extracted is not None and extracted.size > 0:
+                    break
+
+        if extracted is None:
+            # Fallback: use full cropped view
+            extracted = view.copy()
+            st.warning(f"⚠️ Auto-extract failed for **{view_labels[i]}** — using full crop as fallback.")
+
+        shirt_views.append(extracted)
+
+    st.success(f"✅ {len(shirt_views)} shirt views ready!")
+
+# ─────────────────────────────────────────────
+#  SETTINGS
+# ─────────────────────────────────────────────
+with st.expander("⚙️ Advanced settings", expanded=False):
+    conf_thresh    = st.slider("Detection confidence", 0.3, 0.9, 0.45, 0.05)
+    angle_display  = st.checkbox("Overlay angle debug text on frames", value=True)
+    max_frames     = st.number_input(
+        "Max frames to process (0 = all)", min_value=0, value=0, step=50
+    )
+
+# ─────────────────────────────────────────────
+#  PROCESS VIDEO
+# ─────────────────────────────────────────────
+if video_file and shirt_views and st.button("🚀 Transfer Shirt to Video", type="primary"):
+
+    tfile = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4")
+    tfile.write(video_file.read())
+    tfile.flush()
+
+    cap     = cv2.VideoCapture(tfile.name)
+    width   = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    height  = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    fps     = int(cap.get(cv2.CAP_PROP_FPS)) or 25
+    total   = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    limit   = int(max_frames) if max_frames > 0 else total
+
+    out_tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4")
+    out     = cv2.VideoWriter(
+        out_tmp.name,
+        cv2.VideoWriter_fourcc(*"mp4v"),
+        fps,
+        (width, height)
+    )
+
+    progress_bar  = st.progress(0.0)
+    status_text   = st.empty()
+    angle_display_box = st.empty()
+
+    view_labels   = ["Front", "Left Side", "Back", "Right Side"]
+    frame_count   = 0
+
+    while frame_count < limit:
+        ret, frame = cap.read()
+        if not ret:
+            break
+
+        processed, angle, view_idx = apply_shirt_to_frame(
+            frame, predictor, model, shirt_views, conf=conf_thresh
+        )
+
+        if angle_display:
+            label = f"Angle:{angle:+.1f}deg | View:{view_labels[view_idx]}"
+            cv2.putText(processed, label, (12, 36),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 220, 255), 2, cv2.LINE_AA)
+
+        out.write(processed)
+        frame_count += 1
+        pct = frame_count / limit
+        progress_bar.progress(min(pct, 1.0))
+        status_text.markdown(
+            f"Frame **{frame_count}/{limit}** — "
+            f"Angle: `{angle:+.1f}°` → **{view_labels[view_idx]}** view"
+        )
+
+    cap.release()
+    out.release()
+
+    st.success("✅ Processing complete!")
+
+    with open(out_tmp.name, "rb") as f:
+        video_bytes = f.read()
+
+    st.download_button(
+        label="⬇️ Download result video",
+        data=video_bytes,
+        file_name="shirt_transfer_output.mp4",
+        mime="video/mp4",
+    )
+
+    # Quick preview (first frame)
+    cap_preview = cv2.VideoCapture(out_tmp.name)
+    ret, preview_frame = cap_preview.read()
+    cap_preview.release()
+    if ret:
+        st.image(
+            cv2.cvtColor(preview_frame, cv2.COLOR_BGR2RGB),
+            caption="Preview — first frame of result",
+            use_column_width=True
+        )
+
+elif video_file and not shirt_views:
+    st.info("⬆️ Upload the product sheet first to extract shirt views.")
+
+elif not video_file and shirt_views:
+    st.info("⬆️ Upload a video to start processing.")
+
+# ─────────────────────────────────────────────
+#  HOW IT WORKS
+# ─────────────────────────────────────────────
+with st.expander("📖 How the angle detection works", expanded=False):
+    st.markdown("""
+    **Angle estimation (no extra pose model needed):**
+
+    | Body angle | Bounding-box aspect ratio | Chosen shirt view |
+    |---|---|---|
+    | −45° (left turn) | narrow (~0.35) | Left-side image |
+    | 0°  (facing cam) | wide   (~0.55) | Front image     |
+    | +45° (right turn)| narrow (~0.35) | Right-side image|
+
+    The horizontal center of the box relative to the frame width
+    breaks the left/right symmetry.
+
+    **Pipeline per frame:**
+    1. YOLOv8-seg detects shirt bounding box + coarse mask
+    2. SAM refines to a pixel-accurate mask
+    3. Morphological ops (close + open) sharpen edges
+    4. Angle estimated → correct shirt view selected
+    5. Alpha-blend: original pixels outside mask, shirt inside
+
+    For even better accuracy you can plug in a **pose estimator**
+    (e.g. MediaPipe Pose) to get the exact shoulder angle.
+    """)
