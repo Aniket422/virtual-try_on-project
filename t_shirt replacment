@@ -5,163 +5,300 @@ from ultralytics import YOLO
 import tempfile
 from segment_anything import sam_model_registry, SamPredictor
 import torch
+import os
+import mediapipe as mp
+from collections import deque
 
-st.set_page_config(page_title="Cloth Transfer", page_icon="👕")
-st.title("Stable Clothing Transfer")
+st.set_page_config(page_title="Cloth Transfer - Body Rotation", page_icon="👕")
+st.title("Clothing Transfer - Body Rotation Detection")
 
-# ---------------- LOAD MODELS ----------------
+# -------------------------------
+# Load models
+# -------------------------------
 @st.cache_resource
 def load_models():
-    model = YOLO("deepfashion2_yolov8s-seg.pt")
+
+    yolo_model = YOLO("deepfashion2_yolov8s-seg.pt")
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
+
     sam = sam_model_registry["vit_b"](checkpoint="sam_vit_b.pth")
     sam.to(device)
 
     predictor = SamPredictor(sam)
-    return model, predictor
 
-model, predictor = load_models()
+    mp_pose = mp.solutions.pose
+    pose = mp_pose.Pose(
+        static_image_mode=False,
+        model_complexity=1,
+        enable_segmentation=False,
+        min_detection_confidence=0.5
+    )
 
-# ---------------- INPUT ----------------
+    return yolo_model, predictor, pose
+
+
+yolo_model, predictor, pose = load_models()
+
+# -------------------------------
+# Load shirt strip
+# -------------------------------
+
+STRIP_PATH = "product1.jpg"
+
+if not os.path.exists(STRIP_PATH):
+    st.error("Strip image not found.")
+    st.stop()
+
+strip = cv2.imread(STRIP_PATH)
+
+gray = cv2.cvtColor(strip, cv2.COLOR_BGR2GRAY)
+
+_, thresh = cv2.threshold(gray, 240, 255, cv2.THRESH_BINARY_INV)
+
+contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+min_area = 5000
+
+shirt_contours = [c for c in contours if cv2.contourArea(c) > min_area]
+
+shirt_contours = sorted(shirt_contours, key=lambda c: cv2.boundingRect(c)[0])
+
+shirt_images = []
+
+for cnt in shirt_contours:
+
+    x, y, w, h = cv2.boundingRect(cnt)
+
+    crop = strip[y:y+h, x:x+w]
+
+    gray_crop = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
+
+    _, mask = cv2.threshold(gray_crop, 240, 255, cv2.THRESH_BINARY_INV)
+
+    kernel = np.ones((3,3), np.uint8)
+
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
+
+    shirt_images.append((crop, mask))
+
+if len(shirt_images) != 4:
+    st.warning(f"Expected 4 shirts but found {len(shirt_images)}")
+
+# -------------------------------
+# Sidebar settings
+# -------------------------------
+
+st.sidebar.header("Calibration")
+
+angles = [
+    st.sidebar.number_input("View 0 angle", value=0),
+    st.sidebar.number_input("View 1 angle", value=45),
+    st.sidebar.number_input("View 2 angle", value=90),
+    st.sidebar.number_input("View 3 angle", value=135),
+]
+
+smoothing_frames = st.sidebar.slider("Angle smoothing", 1, 30, 10)
+
+show_pose = st.sidebar.checkbox("Show pose skeleton", True)
+
+manual_mode = st.sidebar.checkbox("Manual override", False)
+
+manual_angle = st.sidebar.slider("Manual angle", 0, 360, 0)
+
+# -------------------------------
+# Video input
+# -------------------------------
+
 video_file = st.file_uploader("Upload Video", type=["mp4"])
-source_file = st.file_uploader("Upload Source Image", type=["jpg","png"])
 
-# ---------------- EXTRACT SOURCE CLOTH ----------------
-source_cloth = None
-valid_source = False
-
-if source_file:
-    file_bytes = np.asarray(bytearray(source_file.read()), dtype=np.uint8)
-    source_img = cv2.imdecode(file_bytes, cv2.IMREAD_COLOR)
-
-    results_src = model(source_img, conf=0.6)
-
-    if results_src[0].masks is None:
-        st.error("❌ No clothing detected in image. Try a clearer front-facing shirt image.")
-    else:
-        masks = results_src[0].masks.data.cpu().numpy()
-        boxes = results_src[0].boxes
-
-        found = False
-
-        for mask, box in zip(masks, boxes):
-
-            cls = int(box.cls[0])
-
-            # only shirt
-            if cls not in [0,1]:
-                continue
-
-            if mask is None or mask.size == 0:
-                continue
-
-            mask = (mask > 0.5).astype(np.uint8)
-
-            try:
-                mask = cv2.resize(mask,
-                    (source_img.shape[1], source_img.shape[0]),
-                    interpolation=cv2.INTER_NEAREST)
-            except:
-                continue
-
-            x1, y1, x2, y2 = map(int, box.xyxy[0])
-
-            cloth = source_img.copy()
-            cloth[mask == 0] = 0
-
-            # crop shirt
-            source_cloth = cloth[y1:y2, x1:x2]
-
-            if source_cloth.size == 0:
-                continue
-
-            found = True
-            break
-
-        if not found:
-            st.error("❌ Could not extract shirt. Try another image.")
-        else:
-            valid_source = True
-            st.success("✅ Shirt extracted successfully!")
-
-# ---------------- PROCESS VIDEO ----------------
 if video_file and st.button("Process"):
 
-    if not valid_source:
-        st.error("❌ Please upload a valid shirt image first.")
-    else:
+    tfile = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4")
+    tfile.write(video_file.read())
 
-        tfile = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4")
-        tfile.write(video_file.read())
+    cap = cv2.VideoCapture(tfile.name)
 
-        cap = cv2.VideoCapture(tfile.name)
+    width = int(cap.get(3))
+    height = int(cap.get(4))
+    fps = int(cap.get(cv2.CAP_PROP_FPS))
+    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
 
-        width = int(cap.get(3))
-        height = int(cap.get(4))
-        fps = int(cap.get(cv2.CAP_PROP_FPS))
-        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    out_path = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4").name
 
-        out_path = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4").name
-        out = cv2.VideoWriter(out_path, cv2.VideoWriter_fourcc(*'mp4v'), fps, (width, height))
+    out = cv2.VideoWriter(out_path,
+                          cv2.VideoWriter_fourcc(*'mp4v'),
+                          fps,
+                          (width, height))
 
-        progress = st.progress(0)
-        frame_count = 0
+    progress = st.progress(0)
 
-        while True:
-            ret, frame = cap.read()
-            if not ret:
-                break
+    angle_history = deque(maxlen=smoothing_frames)
 
-            output = frame.copy()
+    last_idx = None
 
-            results = model(frame, conf=0.5)
+    frame_count = 0
 
-            if results[0].boxes is not None:
+    preview = st.empty()
 
-                frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                predictor.set_image(frame_rgb)
+    while True:
 
-                for box in results[0].boxes:
+        ret, frame = cap.read()
 
-                    cls = int(box.cls[0])
-                    if cls not in [0,1]:
-                        continue
+        if not ret:
+            break
 
-                    x1, y1, x2, y2 = map(int, box.xyxy[0])
+        output = frame.copy()
 
-                    input_box = np.array([x1, y1, x2, y2])
+        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
 
-                    masks_sam, _, _ = predictor.predict(
-                        box=input_box,
-                        multimask_output=False
-                    )
+        pose_results = pose.process(rgb)
 
-                    mask = (masks_sam[0] > 0.5).astype(np.uint8)
+        raw_angle = None
+        valid_pose = False
 
-                    mask = cv2.resize(mask, (width, height), interpolation=cv2.INTER_NEAREST)
+        # -------------------------------
+        # Estimate body rotation
+        # -------------------------------
 
-                    mask_roi = mask[y1:y2, x1:x2]
+        if pose_results.pose_landmarks:
 
-                    # ---- SIMPLE ALIGNMENT (STABLE) ----
-                    cloth_resized = cv2.resize(source_cloth, (x2 - x1, y2 - y1))
+            lm = pose_results.pose_landmarks.landmark
 
-                    roi = output[y1:y2, x1:x2]
+            left_shoulder = lm[11]
+            right_shoulder = lm[12]
 
-                    # apply only where mask exists
-                    roi[mask_roi == 1] = cloth_resized[mask_roi == 1]
+            left_hip = lm[23]
+            right_hip = lm[24]
 
-                    output[y1:y2, x1:x2] = roi
+            shoulder_dx = abs(left_shoulder.x - right_shoulder.x)
 
-            out.write(output)
+            hip_dx = abs(left_hip.x - right_hip.x)
 
-            frame_count += 1
-            progress.progress(frame_count / total_frames)
+            if hip_dx > 0:
+                ratio = shoulder_dx / hip_dx
+            else:
+                ratio = 1
 
-        cap.release()
-        out.release()
+            body_angle = np.interp(ratio, [0.3, 1.0], [90, 0])
 
-        st.success("✅ Done!")
+            raw_angle = body_angle
 
-        with open(out_path, "rb") as f:
-            st.download_button("Download Result", f.read(), file_name="output.mp4")
+            angle_history.append(raw_angle)
+
+            valid_pose = True
+
+            if show_pose:
+                mp.solutions.drawing_utils.draw_landmarks(
+                    output,
+                    pose_results.pose_landmarks,
+                    mp.solutions.pose.POSE_CONNECTIONS
+                )
+
+        # -------------------------------
+        # Smooth angle
+        # -------------------------------
+
+        if len(angle_history) > 0:
+            smoothed_angle = np.mean(angle_history)
+        else:
+            smoothed_angle = 0
+
+        if manual_mode:
+            body_angle = manual_angle
+        else:
+            body_angle = smoothed_angle
+
+        # -------------------------------
+        # Map angle to closest shirt view
+        # -------------------------------
+
+        target_angle = min(angles, key=lambda a: abs(a-body_angle))
+
+        new_idx = angles.index(target_angle)
+
+        if last_idx is None:
+            last_idx = new_idx
+
+        if abs(new_idx - last_idx) >= 1:
+            last_idx = new_idx
+
+        idx = last_idx
+
+        # -------------------------------
+        # Detect shirt area
+        # -------------------------------
+
+        results = yolo_model(frame, conf=0.5)
+
+        if results[0].boxes is not None:
+
+            predictor.set_image(rgb)
+
+            for box in results[0].boxes:
+
+                cls = int(box.cls[0])
+
+                if cls not in [0,1]:
+                    continue
+
+                x1,y1,x2,y2 = map(int, box.xyxy[0])
+
+                input_box = np.array([x1,y1,x2,y2])
+
+                masks,_,_ = predictor.predict(box=input_box, multimask_output=False)
+
+                mask = (masks[0] > 0.5).astype(np.uint8) * 255
+
+                kernel = np.ones((5,5), np.uint8)
+
+                mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
+                mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
+
+                shirt_img, shirt_mask = shirt_images[idx]
+
+                shirt_resized = cv2.resize(shirt_img, (x2-x1, y2-y1))
+
+                mask_resized = cv2.resize(shirt_mask, (x2-x1, y2-y1),
+                                          interpolation=cv2.INTER_NEAREST)
+
+                mask_crop = mask[y1:y2, x1:x2]
+
+                mask_crop = cv2.resize(mask_crop,
+                                       (shirt_resized.shape[1], shirt_resized.shape[0]),
+                                       interpolation=cv2.INTER_NEAREST)
+
+                mask_final = cv2.bitwise_and(mask_crop, mask_resized)
+
+                mask_float = mask_final.astype(np.float32)/255.0
+                mask_float = mask_float[...,np.newaxis]
+
+                roi = output[y1:y2, x1:x2]
+
+                blended = (roi*(1-mask_float) + shirt_resized*mask_float).astype(np.uint8)
+
+                output[y1:y2, x1:x2] = blended
+
+        # -------------------------------
+        # Write frame
+        # -------------------------------
+
+        out.write(output)
+
+        frame_count += 1
+
+        progress.progress(frame_count/total_frames)
+
+        if frame_count % 10 == 0:
+            preview.image(cv2.cvtColor(output, cv2.COLOR_BGR2RGB),
+                          caption=f"Frame {frame_count} | angle {body_angle:.1f}° | view {idx}",
+                          use_container_width=True)
+
+    cap.release()
+    out.release()
+
+    st.success("Processing complete")
+
+    with open(out_path, "rb") as f:
+        st.download_button("Download video", f.read(), file_name="output.mp4")
