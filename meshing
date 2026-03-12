@@ -1,11 +1,12 @@
 """
 5-Region Body Mesh  —  Separate mesh per body part + clothing
-=============================================================
+==============================================================
   🔴 SHIRT   — full garment shape (primary, drawn on top)
   🔵 PANTS   — waistband detected via color saturation scan
   🟢 ARMS    — each arm separated by shoulder X boundary
   🟡 HEAD    — head/neck region
   Zero overlap between all regions.
+  **Skin removal** ensures only clothing appears in the mesh.
 
 Run:  streamlit run app.py   (auto-installs everything)
 """
@@ -17,22 +18,25 @@ def _pip(pkg, mod=None):
         subprocess.check_call([sys.executable,"-m","pip","install",pkg,"--quiet"],
                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 _pip("opencv-python","cv2"); _pip("numpy"); _pip("requests"); _pip("scipy")
-_pip("ai-edge-litert","ai_edge_litert"); _pip("imageio-ffmpeg","imageio_ffmpeg")
+_pip("tflite-runtime","tflite_runtime")      # <-- changed from ai-edge-litert
+_pip("imageio-ffmpeg","imageio_ffmpeg")
 _pip("streamlit")
 
 import streamlit as st
 import cv2, numpy as np, tempfile, os, io, tarfile, time, requests
 import subprocess as _sp, imageio_ffmpeg
 from scipy.ndimage import uniform_filter1d
+from tflite_runtime.interpreter import Interpreter   # <-- changed import
 
 FFMPEG = imageio_ffmpeg.get_ffmpeg_exe()
 
 st.set_page_config(page_title="5-Region Mesh", page_icon="🔬", layout="centered")
-st.title("🔬 5-Region Body Mesh")
+st.title("🔬 5-Region Body Mesh (Clothing Only)")
 st.markdown(
     "Each body part and garment gets its **own separate mesh** with zero overlap:  \n"
     "🔴 **Shirt** (primary) &nbsp;|&nbsp; 🔵 **Pants** &nbsp;|&nbsp; "
-    "🟢 **Arms** &nbsp;|&nbsp; 🟡 **Head/neck**"
+    "🟢 **Arms** &nbsp;|&nbsp; 🟡 **Head/neck**  \n"
+    "*Skin pixels are automatically removed – only clothing remains.*"
 )
 st.divider()
 
@@ -42,7 +46,6 @@ NPM_URL   = "https://registry.npmjs.org/@mediapipe/pose/-/pose-0.5.1675469404.tg
 
 @st.cache_resource(show_spinner=False)
 def load_model():
-    from ai_edge_litert.interpreter import Interpreter
     os.makedirs(MODEL_DIR, exist_ok=True)
     p = os.path.join(MODEL_DIR, "pose_landmark_heavy.tflite")
     if not os.path.exists(p):
@@ -128,82 +131,170 @@ def cc_seed(zone, sx, sy, h, w):
     return (labels==best).astype(np.uint8)*255
 
 
+def get_skin_mask(frame, lower_skin=None, upper_skin=None):
+    """
+    Returns a binary mask of skin pixels using HSV thresholds.
+    Default thresholds work for many skin tones under good lighting.
+    """
+    if lower_skin is None:
+        lower_skin = np.array([0, 20, 70], dtype=np.uint8)
+    if upper_skin is None:
+        upper_skin = np.array([20, 150, 255], dtype=np.uint8)
+    hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+    mask = cv2.inRange(hsv, lower_skin, upper_skin)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, np.ones((3,3), np.uint8))
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, np.ones((5,5), np.uint8))
+    return mask
+
+
 def get_5masks(frame, lm_s, seg_s, wb_s):
-    """
-    Five non-overlapping regions:
-      shirt  = full shirt contour (shoulder→waistband, full body width)
-      larm   = left arm  (outside shoulder X, shoulder→wrist)
-      rarm   = right arm (outside shoulder X, shoulder→wrist)
-      pants  = waistband→ankle, full body width
-      head   = above shoulder line
-    Priority: shirt > arms > pants > head (shirt drawn last = on top)
-    """
-    h, w = frame.shape[:2]; vis = lm_s[:,3]
-    def ly(i,fb): return int(lm_s[i,1]/256*h) if vis[i]>0.15 else fb
-    def lx(i,fb): return int(lm_s[i,0]/256*w) if vis[i]>0.15 else fb
+    h, w = frame.shape[:2]
+    vis = lm_s[:,3]
 
-    nose_x,  nose_y  = lx(0,w//2),      ly(0,int(h*.15))
-    ls_x,    ls_y    = lx(11,int(w*.38)),ly(11,int(h*.38))
-    rs_x,    rs_y    = lx(12,int(w*.62)),ly(12,int(h*.38))
-    le_x,    le_y    = lx(13,int(w*.40)),ly(13,int(h*.55))
-    re_x,    re_y    = lx(14,int(w*.60)),ly(14,int(h*.55))
-    lw_x,    lw_y    = lx(15,int(w*.42)),ly(15,int(h*.75))
-    rw_x,    rw_y    = lx(16,int(w*.58)),ly(16,int(h*.75))
+    def ly(i, fb): return int(lm_s[i,1]/256*h) if vis[i]>0.15 else fb
+    def lx(i, fb): return int(lm_s[i,0]/256*w) if vis[i]>0.15 else fb
 
-    shoulder_y    = min(ls_y, rs_y)
-    arm_excl_left = min(ls_x, rs_x) - int(w*.01)   # right arm beyond this (to the left)
-    arm_excl_right= max(ls_x, rs_x) + int(w*.01)   # left arm beyond this (to the right)
-    ankle_y       = max(ly(27,0), ly(28,0))
-    if ankle_y < wb_s + int(h*.05): ankle_y = min(h, wb_s + int(h*.40))
+    # --- Head (unchanged, above eyes) ---
+    nose_x, nose_y = lx(0, w//2), ly(0, int(h*.15))
+    eye_ys = [ly(i,0) for i in range(1,7) if vis[i]>0.15]
+    eye_y_min = min(eye_ys) if eye_ys else nose_y
 
-    seg_u8  = (seg_s*255).astype(np.uint8)
+    # --- Shirt: neck to waistband (unchanged) ---
+    ls_x, ls_y = lx(11, int(w*.38)), ly(11, int(h*.38))
+    rs_x, rs_y = lx(12, int(w*.62)), ly(12, int(h*.38))
+    shoulder_y = min(ls_y, rs_y)
+    # Estimate neck (same as before)
+    mouth_y = None
+    if vis[9] > 0.15 and vis[10] > 0.15:
+        mouth_y = (ly(9,0) + ly(10,0)) // 2
+    ear_y = None
+    if vis[7] > 0.15 and vis[8] > 0.15:
+        ear_y = (ly(7,0) + ly(8,0)) // 2
+    if mouth_y is not None:
+        neck_y = int(mouth_y + (shoulder_y - mouth_y) * 0.3)
+    elif ear_y is not None:
+        neck_y = int(ear_y + (shoulder_y - ear_y) * 0.4)
+    else:
+        neck_y = shoulder_y - int(h * 0.05)
+    neck_y = max(0, min(neck_y, shoulder_y))
+
+    # --- Prepare segmentation binary ---
+    seg_u8 = (seg_s * 255).astype(np.uint8)
     seg_bin = cv2.morphologyEx(
         cv2.threshold(seg_u8, 120, 255, cv2.THRESH_BINARY)[1],
         cv2.MORPH_CLOSE, np.ones((9,9), np.uint8))
     k3 = np.ones((3,3), np.uint8)
 
-    # ── SHIRT: full CC in torso zone, shoulder→waistband ─────────
-    sz = seg_bin.copy()
-    sz[:max(0, shoulder_y-int(h*.02)), :] = 0
-    sz[min(h, wb_s+int(h*.01)):, :]       = 0
-    shirt = cc_seed(sz, (ls_x+rs_x)//2, (shoulder_y+wb_s)//2, h, w)
-
-    # ── LEFT ARM: pixels right of arm_excl_right, shoulder→wrist ─
-    la = seg_bin.copy()
-    la[:max(0, ls_y-int(h*.02)), :] = 0
-    la[min(h, lw_y+int(h*.06)):, :] = 0
-    la[:, :max(0, arm_excl_right-int(w*.005))] = 0
-    larm = cc_seed(la, le_x, le_y, h, w)
-    larm = cv2.subtract(larm, shirt)
-
-    # ── RIGHT ARM: pixels left of arm_excl_left, shoulder→wrist ──
-    ra = seg_bin.copy()
-    ra[:max(0, rs_y-int(h*.02)), :] = 0
-    ra[min(h, rw_y+int(h*.06)):, :] = 0
-    ra[:, min(w, arm_excl_left+int(w*.005)):] = 0
-    rarm = cc_seed(ra, re_x, re_y, h, w)
-    rarm = cv2.subtract(rarm, shirt)
-
-    # ── PANTS: full body width at waistband, below waistband ──────
-    wb_row = seg_bin[min(h-1, wb_s+5), :]
-    nz     = np.where(wb_row > 0)[0]
-    pl     = int(nz[0])  if len(nz) else int(w*.2)
-    pr     = int(nz[-1]) if len(nz) else int(w*.8)
-    pz     = seg_bin.copy()
-    pz[:max(0, wb_s-5), :]               = 0
-    pz[min(h, ankle_y+int(h*.03)):, :]   = 0
-    pz[:, :max(0, pl-int(w*.03))]        = 0
-    pz[:, min(w, pr+int(w*.03)):]        = 0
-    pz = cv2.subtract(pz, cv2.bitwise_or(shirt, cv2.bitwise_or(larm, rarm)))
-    pants = cc_seed(pz, (pl+pr)//2, wb_s+int(h*.06), h, w)
-
-    # ── HEAD: above shoulder, seeded from nose ─────────────────
+    # --- Head mask ---
     hz = seg_bin.copy()
-    hz[min(h, shoulder_y+int(h*.03)):, :] = 0
-    head = cc_seed(hz, nose_x, nose_y, h, w)
+    hz[min(h, eye_y_min - int(h*0.02)):, :] = 0
+    head = cc_seed(hz, nose_x, max(10, eye_y_min-30), h, w)
 
-    for m in [shirt, larm, rarm, pants, head]:
+    # --- Shirt mask ---
+    sz = seg_bin.copy()
+    sz[:max(0, neck_y), :] = 0
+    sz[min(h, wb_s + int(h*0.01)):, :] = 0
+    seed_x = (ls_x + rs_x) // 2
+    seed_y = min(shoulder_y, neck_y + int(h*0.05))
+    shirt = cc_seed(sz, seed_x, seed_y, h, w)
+    shirt = cv2.subtract(shirt, head)
+
+    # --- Pants: robust detection using landmarks and color ---
+    # Gather lower body landmarks
+    lhip = (lx(23, ls_x), ly(23, h//2))
+    rhip = (lx(24, rs_x), ly(24, h//2))
+    lknee = (lx(25, lhip[0]), ly(25, h*3//4))
+    rknee = (lx(26, rhip[0]), ly(26, h*3//4))
+    lankle = (lx(27, lhip[0]), ly(27, h-10))
+    rankle = (lx(28, rhip[0]), ly(28, h-10))
+
+    # Determine top of pants region (waistband)
+    top_y = wb_s
+    # Determine bottom (use knees if visible and above ankles, else ankles)
+    bottom_y = h-1
+    if vis[25] > 0.15 or vis[26] > 0.15:
+        knee_y = max(ly(25,0), ly(26,0))
+        if knee_y > top_y + 20:   # knee should be below waist
+            bottom_y = min(bottom_y, knee_y + int(h*0.03))
+    # Ankles as fallback
+    ankle_y = max(ly(27,0), ly(28,0))
+    if ankle_y > top_y + 20:
+        bottom_y = min(bottom_y, ankle_y + int(h*0.03))
+    else:
+        bottom_y = min(h-1, top_y + int(h*0.6))   # fallback if no landmarks
+
+    # Determine left/right bounds using hip/knee/ankle x positions
+    xs = []
+    for (x,_) in [lhip, rhip, lknee, rknee, lankle, rankle]:
+        if x > 0 and x < w:
+            xs.append(x)
+    if len(xs) >= 2:
+        left_x = max(0, min(xs) - int(w*0.05))
+        right_x = min(w, max(xs) + int(w*0.05))
+    else:
+        # fallback to waistband row width
+        wb_row = seg_bin[min(h-1, top_y), :]
+        nz = np.where(wb_row > 0)[0]
+        if len(nz):
+            left_x = max(0, nz[0] - int(w*0.03))
+            right_x = min(w, nz[-1] + int(w*0.03))
+        else:
+            left_x, right_x = int(w*0.2), int(w*0.8)
+
+    # Create initial pants zone
+    pz = seg_bin.copy()
+    pz[:max(0, top_y - 5), :] = 0
+    pz[min(h, bottom_y):, :] = 0
+    pz[:, :left_x] = 0
+    pz[:, right_x:] = 0
+    # Remove head and shirt
+    pz = cv2.subtract(pz, cv2.bitwise_or(head, shirt))
+
+    # Optional: color-based refinement to keep only pixels that look like pants
+    # Sample a small patch just below the waistband (center of bounding box) to get dominant color
+    sample_x = (left_x + right_x) // 2
+    sample_y = min(h-1, top_y + 20)
+    sample_w = 30
+    sample_rect = frame[max(0,sample_y-10):min(h,sample_y+10),
+                        max(0,sample_x-15):min(w,sample_x+15)]
+    if sample_rect.size > 0:
+        # Convert to HSV and compute median hue, saturation
+        hsv_rect = cv2.cvtColor(sample_rect, cv2.COLOR_BGR2HSV).reshape(-1,3)
+        median_hue = np.median(hsv_rect[:,0])
+        # Allow a hue range around the median
+        hue_low = max(0, median_hue - 15)
+        hue_high = min(180, median_hue + 15)
+        # Create color mask for the whole pants zone
+        hsv_full = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+        color_mask = cv2.inRange(hsv_full, (hue_low, 30, 30), (hue_high, 255, 255))
+        # Keep only pixels that are both in pz and have pants-like color
+        pz = cv2.bitwise_and(pz, color_mask)
+
+    # Now find the largest connected component inside pz (seed at sample point)
+    if np.any(pz):
+        # Use sample point as seed if it's inside pz, else fallback to center
+        if pz[sample_y, sample_x] > 0:
+            seed_pt = (sample_x, sample_y)
+        else:
+            seed_pt = ((left_x+right_x)//2, (top_y+bottom_y)//2)
+        pants = cc_seed(pz, seed_pt[0], seed_pt[1], h, w)
+    else:
+        pants = np.zeros((h,w), dtype=np.uint8)
+
+    # Clean masks
+    for m in [head, shirt, pants]:
         cv2.morphologyEx(m, cv2.MORPH_OPEN, k3, dst=m)
+
+    # --- Remove skin ---
+    skin_mask = get_skin_mask(frame)
+    skin_inv = cv2.bitwise_not(skin_mask)
+    head  = cv2.bitwise_and(head, skin_inv)
+    shirt = cv2.bitwise_and(shirt, skin_inv)
+    pants = cv2.bitwise_and(pants, skin_inv)
+
+    # Return five masks (arms empty)
+    larm = np.zeros((h,w), dtype=np.uint8)
+    rarm = np.zeros((h,w), dtype=np.uint8)
     return head, larm, rarm, shirt, pants
 
 
