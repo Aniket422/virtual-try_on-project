@@ -1,0 +1,365 @@
+"""
+5-Region Body Mesh  —  Separate mesh per body part + clothing
+=============================================================
+  🔴 SHIRT   — full garment shape (primary, drawn on top)
+  🔵 PANTS   — waistband detected via color saturation scan
+  🟢 ARMS    — each arm separated by shoulder X boundary
+  🟡 HEAD    — head/neck region
+  Zero overlap between all regions.
+
+Run:  streamlit run app.py   (auto-installs everything)
+"""
+
+import subprocess, sys, importlib
+def _pip(pkg, mod=None):
+    try: importlib.import_module(mod or pkg.replace("-","_").split("[")[0])
+    except ImportError:
+        subprocess.check_call([sys.executable,"-m","pip","install",pkg,"--quiet"],
+                              stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+_pip("opencv-python","cv2"); _pip("numpy"); _pip("requests"); _pip("scipy")
+_pip("ai-edge-litert","ai_edge_litert"); _pip("imageio-ffmpeg","imageio_ffmpeg")
+_pip("streamlit")
+
+import streamlit as st
+import cv2, numpy as np, tempfile, os, io, tarfile, time, requests
+import subprocess as _sp, imageio_ffmpeg
+from scipy.ndimage import uniform_filter1d
+
+FFMPEG = imageio_ffmpeg.get_ffmpeg_exe()
+
+st.set_page_config(page_title="5-Region Mesh", page_icon="🔬", layout="centered")
+st.title("🔬 5-Region Body Mesh")
+st.markdown(
+    "Each body part and garment gets its **own separate mesh** with zero overlap:  \n"
+    "🔴 **Shirt** (primary) &nbsp;|&nbsp; 🔵 **Pants** &nbsp;|&nbsp; "
+    "🟢 **Arms** &nbsp;|&nbsp; 🟡 **Head/neck**"
+)
+st.divider()
+
+# ── Model ─────────────────────────────────────────────────────────────────────
+MODEL_DIR = os.path.join(tempfile.gettempdir(), "blazepose_models")
+NPM_URL   = "https://registry.npmjs.org/@mediapipe/pose/-/pose-0.5.1675469404.tgz"
+
+@st.cache_resource(show_spinner=False)
+def load_model():
+    from ai_edge_litert.interpreter import Interpreter
+    os.makedirs(MODEL_DIR, exist_ok=True)
+    p = os.path.join(MODEL_DIR, "pose_landmark_heavy.tflite")
+    if not os.path.exists(p):
+        with st.spinner("⬇️ Downloading BlazePose (~28 MB) — one-time only…"):
+            r = requests.get(NPM_URL, timeout=300); r.raise_for_status()
+            with tarfile.open(fileobj=io.BytesIO(r.content)) as t:
+                data = t.extractfile("package/pose_landmark_heavy.tflite").read()
+            open(p,"wb").write(data)
+    i = Interpreter(model_path=p); i.allocate_tensors(); return i
+
+with st.spinner("Loading model…"): LM = load_model()
+st.success("✅ BlazePose Heavy ready"); st.divider()
+
+# ── Settings ──────────────────────────────────────────────────────────────────
+st.subheader("⚙️ Settings")
+c1, c2 = st.columns(2)
+with c1:
+    shirt_hex = st.color_picker("🔴 Shirt",  "#FF2020")
+    pants_hex = st.color_picker("🔵 Pants",  "#2060FF")
+    arm_hex   = st.color_picker("🟢 Arms",   "#00CC00")
+    head_hex  = st.color_picker("🟡 Head",   "#FFEE00")
+with c2:
+    grid_step    = st.slider("Mesh density (lower=denser)", 16, 56, 22)
+    line_thick   = st.slider("Line thickness", 1, 3, 1)
+    smooth_alpha = st.slider("Smoothing  (lower = less flicker)", 0.10, 0.55, 0.25, step=0.05)
+    show_nodes   = st.checkbox("Show landmark nodes", True)
+    output_w     = st.selectbox("Output width (px)", [540, 720, 1080])
+st.divider()
+
+st.subheader("📹 Upload Video")
+uploaded = st.file_uploader("Upload a video of a person", type=["mp4","avi","mov","mkv"])
+
+# ── Core ──────────────────────────────────────────────────────────────────────
+def hex_bgr(h):
+    h=h.lstrip("#"); return (int(h[4:6],16),int(h[2:4],16),int(h[0:2],16))
+
+
+class EMA:
+    """Per-key exponential moving average — smooths landmarks, segmentation, waistband."""
+    def __init__(self, alpha=0.25): self.a=alpha; self.state={}
+    def reset(self): self.state={}
+    def update(self, key, val):
+        if key not in self.state:
+            self.state[key] = val.copy() if hasattr(val,'copy') else float(val)
+        else:
+            if hasattr(val,'copy'): self.state[key] = self.a*val + (1-self.a)*self.state[key]
+            else: self.state[key] = self.a*float(val) + (1-self.a)*self.state[key]
+        return self.state[key]
+
+
+def detect_waistband(frame, seg_bin, hip_y, ls_x, rs_x, h, w):
+    """
+    Scan a vertical saturation profile through the torso center.
+    Shirt=white (sat≈0), pants=colored (sat>0).
+    Waistband = row with biggest positive saturation jump below hip landmark.
+    """
+    cx = int(np.clip((ls_x+rs_x)//2, 40, w-40))
+    ry, sats = [], []
+    for y in range(max(0, hip_y-int(h*.05)), min(h-1, hip_y+int(h*.38))):
+        if seg_bin[y, cx] == 0: continue
+        x0, x1 = max(0,cx-50), min(w,cx+50)
+        ins = frame[y,x0:x1][seg_bin[y,x0:x1]>0]
+        if len(ins) < 10: continue
+        hsv = cv2.cvtColor(ins.reshape(1,-1,3), cv2.COLOR_BGR2HSV)[0]
+        ry.append(y); sats.append(float(hsv[:,1].mean()))
+    if len(ry) < 20: return hip_y + int(h*.15)
+    ry = np.array(ry)
+    ss = uniform_filter1d(np.array(sats), size=15)
+    d  = np.diff(ss)
+    si = np.searchsorted(ry, hip_y)
+    if si < len(d)-5: return int(ry[int(np.argmax(d[si:]))+si])
+    return hip_y + int(h*.15)
+
+
+def cc_seed(zone, sx, sy, h, w):
+    """Return CC containing (sx,sy), or largest CC if seed misses."""
+    sx, sy = int(np.clip(sx,1,w-2)), int(np.clip(sy,1,h-2))
+    if zone.sum() == 0: return np.zeros((h,w), np.uint8)
+    _, labels, stats, _ = cv2.connectedComponentsWithStats(zone)
+    lbl = int(labels[sy, sx])
+    if lbl > 0: return (labels==lbl).astype(np.uint8)*255
+    best = int(np.argmax(stats[1:, cv2.CC_STAT_AREA])+1)
+    return (labels==best).astype(np.uint8)*255
+
+
+def get_5masks(frame, lm_s, seg_s, wb_s):
+    """
+    Five non-overlapping regions:
+      shirt  = full shirt contour (shoulder→waistband, full body width)
+      larm   = left arm  (outside shoulder X, shoulder→wrist)
+      rarm   = right arm (outside shoulder X, shoulder→wrist)
+      pants  = waistband→ankle, full body width
+      head   = above shoulder line
+    Priority: shirt > arms > pants > head (shirt drawn last = on top)
+    """
+    h, w = frame.shape[:2]; vis = lm_s[:,3]
+    def ly(i,fb): return int(lm_s[i,1]/256*h) if vis[i]>0.15 else fb
+    def lx(i,fb): return int(lm_s[i,0]/256*w) if vis[i]>0.15 else fb
+
+    nose_x,  nose_y  = lx(0,w//2),      ly(0,int(h*.15))
+    ls_x,    ls_y    = lx(11,int(w*.38)),ly(11,int(h*.38))
+    rs_x,    rs_y    = lx(12,int(w*.62)),ly(12,int(h*.38))
+    le_x,    le_y    = lx(13,int(w*.40)),ly(13,int(h*.55))
+    re_x,    re_y    = lx(14,int(w*.60)),ly(14,int(h*.55))
+    lw_x,    lw_y    = lx(15,int(w*.42)),ly(15,int(h*.75))
+    rw_x,    rw_y    = lx(16,int(w*.58)),ly(16,int(h*.75))
+
+    shoulder_y    = min(ls_y, rs_y)
+    arm_excl_left = min(ls_x, rs_x) - int(w*.01)   # right arm beyond this (to the left)
+    arm_excl_right= max(ls_x, rs_x) + int(w*.01)   # left arm beyond this (to the right)
+    ankle_y       = max(ly(27,0), ly(28,0))
+    if ankle_y < wb_s + int(h*.05): ankle_y = min(h, wb_s + int(h*.40))
+
+    seg_u8  = (seg_s*255).astype(np.uint8)
+    seg_bin = cv2.morphologyEx(
+        cv2.threshold(seg_u8, 120, 255, cv2.THRESH_BINARY)[1],
+        cv2.MORPH_CLOSE, np.ones((9,9), np.uint8))
+    k3 = np.ones((3,3), np.uint8)
+
+    # ── SHIRT: full CC in torso zone, shoulder→waistband ─────────
+    sz = seg_bin.copy()
+    sz[:max(0, shoulder_y-int(h*.02)), :] = 0
+    sz[min(h, wb_s+int(h*.01)):, :]       = 0
+    shirt = cc_seed(sz, (ls_x+rs_x)//2, (shoulder_y+wb_s)//2, h, w)
+
+    # ── LEFT ARM: pixels right of arm_excl_right, shoulder→wrist ─
+    la = seg_bin.copy()
+    la[:max(0, ls_y-int(h*.02)), :] = 0
+    la[min(h, lw_y+int(h*.06)):, :] = 0
+    la[:, :max(0, arm_excl_right-int(w*.005))] = 0
+    larm = cc_seed(la, le_x, le_y, h, w)
+    larm = cv2.subtract(larm, shirt)
+
+    # ── RIGHT ARM: pixels left of arm_excl_left, shoulder→wrist ──
+    ra = seg_bin.copy()
+    ra[:max(0, rs_y-int(h*.02)), :] = 0
+    ra[min(h, rw_y+int(h*.06)):, :] = 0
+    ra[:, min(w, arm_excl_left+int(w*.005)):] = 0
+    rarm = cc_seed(ra, re_x, re_y, h, w)
+    rarm = cv2.subtract(rarm, shirt)
+
+    # ── PANTS: full body width at waistband, below waistband ──────
+    wb_row = seg_bin[min(h-1, wb_s+5), :]
+    nz     = np.where(wb_row > 0)[0]
+    pl     = int(nz[0])  if len(nz) else int(w*.2)
+    pr     = int(nz[-1]) if len(nz) else int(w*.8)
+    pz     = seg_bin.copy()
+    pz[:max(0, wb_s-5), :]               = 0
+    pz[min(h, ankle_y+int(h*.03)):, :]   = 0
+    pz[:, :max(0, pl-int(w*.03))]        = 0
+    pz[:, min(w, pr+int(w*.03)):]        = 0
+    pz = cv2.subtract(pz, cv2.bitwise_or(shirt, cv2.bitwise_or(larm, rarm)))
+    pants = cc_seed(pz, (pl+pr)//2, wb_s+int(h*.06), h, w)
+
+    # ── HEAD: above shoulder, seeded from nose ─────────────────
+    hz = seg_bin.copy()
+    hz[min(h, shoulder_y+int(h*.03)):, :] = 0
+    head = cc_seed(hz, nose_x, nose_y, h, w)
+
+    for m in [shirt, larm, rarm, pants, head]:
+        cv2.morphologyEx(m, cv2.MORPH_OPEN, k3, dst=m)
+    return head, larm, rarm, shirt, pants
+
+
+def delaunay(mask, extra_pts, w, h, gs):
+    cnts,_ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
+    mc = None; cp = []
+    if cnts:
+        mc   = max(cnts, key=cv2.contourArea)
+        simp = cv2.approxPolyDP(mc, 3, True)
+        step = max(1, len(simp)//60)
+        cp   = [(int(simp[i][0][0]), int(simp[i][0][1]))
+                for i in range(0, len(simp), step)
+                if 0 < simp[i][0][0] < w and 0 < simp[i][0][1] < h]
+    mn = mask.astype(np.float32)/255
+    ip = [(gx,gy) for gy in range(gs,h-gs,gs)
+                  for gx in range(gs,w-gs,gs) if mn[gy,gx] > 0.5]
+    pts = list(set(extra_pts + cp + ip))
+    if len(pts) < 4: return [], mc
+    sd = cv2.Subdiv2D((0,0,w,h))
+    for p in pts:
+        try: sd.insert(p)
+        except: pass
+    tris = []
+    for x1,y1,x2,y2,x3,y3 in sd.getTriangleList():
+        cx=(int(x1)+int(x2)+int(x3))//3; cy=(int(y1)+int(y2)+int(y3))//3
+        if 0<cx<w and 0<cy<h and mn[cy,cx] > 0.35:
+            tris.append((int(x1),int(y1),int(x2),int(y2),int(x3),int(y3)))
+    return tris, mc
+
+
+def draw_layer(canvas, tris, outline, color, lt, fa):
+    if not tris: return
+    ov = canvas.copy()
+    fc = tuple(max(0, int(c*0.06)) for c in color)
+    for x1,y1,x2,y2,x3,y3 in tris:
+        cv2.fillPoly(ov, [np.array([[x1,y1],[x2,y2],[x3,y3]])], fc)
+    canvas[:] = cv2.addWeighted(canvas, 1-fa, ov, fa, 0)
+    for x1,y1,x2,y2,x3,y3 in tris:
+        cv2.polylines(canvas, [np.array([[x1,y1],[x2,y2],[x3,y3]])], True, color, lt)
+    if outline is not None:
+        cv2.drawContours(canvas, [outline], -1, color, 2)
+
+
+def process_frame(frame, interp, ema, cfg):
+    h, w = frame.shape[:2]
+    inp = cv2.cvtColor(cv2.resize(frame,(256,256)),cv2.COLOR_BGR2RGB).astype(np.float32)/255
+    interp.set_tensor(interp.get_input_details()[0]["index"], inp[np.newaxis])
+    interp.invoke()
+    lm  = interp.get_tensor(696)[0].reshape(39,5).copy()
+    seg = interp.get_tensor(565)[0,:,:,0]
+    prs = float(interp.get_tensor(701)[0,0])
+    lm[:,3]=1/(1+np.exp(-lm[:,3])); lm[:,4]=1/(1+np.exp(-lm[:,4]))
+    seg_up = cv2.resize(1/(1+np.exp(-seg)), (w,h))
+
+    if not (prs > 0.3 or np.mean(lm[:,3][:17]) > 0.3):
+        ema.reset(); return frame
+
+    vis = lm[:,3]
+    def ly(i,fb): return int(lm[i,1]/256*h) if vis[i]>0.15 else fb
+    def lx(i,fb): return int(lm[i,0]/256*w) if vis[i]>0.15 else fb
+    hip_y = max(ly(23,int(h*.60)), ly(24,int(h*.60)))
+    ls_x  = lx(11,int(w*.38)); rs_x = lx(12,int(w*.62))
+
+    # Detect waistband on raw (unsmoothed) frame
+    seg_rb = cv2.morphologyEx(
+        cv2.threshold((seg_up*255).astype(np.uint8),120,255,cv2.THRESH_BINARY)[1],
+        cv2.MORPH_CLOSE, np.ones((9,9),np.uint8))
+    wb = detect_waistband(frame, seg_rb, hip_y, ls_x, rs_x, h, w)
+
+    # Smooth all signals
+    lm_s   = ema.update('lm',  lm)
+    seg_s  = ema.update('seg', seg_up)
+    wb_s   = int(ema.update('wb', float(wb)))
+
+    hm, lam, ram, sm, pm = get_5masks(frame, lm_s, seg_s, wb_s)
+
+    vs = lm_s[:,3]
+    lm_pts = [(int(lm_s[i,0]/256*w), int(lm_s[i,1]/256*h))
+              for i in range(39) if vs[i]>0.15
+              and 3<lm_s[i,0]/256*w<w-3 and 3<lm_s[i,1]/256*h<h-3]
+    def inn(pts, mask): return [(x,y) for x,y in pts if 0<=y<h and 0<=x<w and mask[y,x]>127]
+
+    gs = cfg["gs"]; lt = cfg["lt"]
+    canvas = frame.copy()
+
+    # Draw order: head → arms → pants → shirt (primary, drawn last = most visible)
+    ht,hc = delaunay(hm,  inn(lm_pts,hm),  w,h,gs); draw_layer(canvas,ht,hc,  cfg["head"], lt,0.06)
+    lt2,lc= delaunay(lam, inn(lm_pts,lam), w,h,gs); draw_layer(canvas,lt2,lc, cfg["arm"],  lt,0.06)
+    rt2,rc= delaunay(ram, inn(lm_pts,ram), w,h,gs); draw_layer(canvas,rt2,rc, cfg["arm"],  lt,0.06)
+    pt,pc = delaunay(pm,  inn(lm_pts,pm),  w,h,gs); draw_layer(canvas,pt,pc,  cfg["pants"],lt,0.09)
+    st2,sc= delaunay(sm,  inn(lm_pts,sm),  w,h,gs); draw_layer(canvas,st2,sc, cfg["shirt"],lt,0.15)
+
+    if cfg["nodes"]:
+        for px,py in lm_pts:
+            cv2.circle(canvas,(px,py),4,(0,255,180),-1)
+            cv2.circle(canvas,(px,py),2,(255,255,255),-1)
+    return canvas
+
+
+# ── Run ───────────────────────────────────────────────────────────────────────
+if uploaded:
+    st.video(uploaded)
+    if st.button("▶️ Generate Mesh Video", type="primary", use_container_width=True):
+        cfg = dict(
+            shirt = hex_bgr(shirt_hex),
+            pants = hex_bgr(pants_hex),
+            arm   = hex_bgr(arm_hex),
+            head  = hex_bgr(head_hex),
+            gs    = grid_step,
+            lt    = line_thick,
+            nodes = show_nodes,
+        )
+        tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4")
+        tmp.write(uploaded.read()); tmp.close()
+
+        cap  = cv2.VideoCapture(tmp.name)
+        fps  = cap.get(cv2.CAP_PROP_FPS) or 25
+        ow_  = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        oh_  = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        tot  = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        sc   = output_w / max(ow_,1)
+        ow, oh = output_w, int(oh_*sc) & ~1
+
+        raw = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4").name
+        wrt = cv2.VideoWriter(raw, cv2.VideoWriter_fourcc(*"mp4v"), fps, (ow,oh))
+
+        ema  = EMA(alpha=smooth_alpha)
+        prog = st.progress(0, "Starting…"); prev = st.empty()
+        t0 = time.time(); fi = 0
+
+        while True:
+            ret, frame = cap.read()
+            if not ret: break
+            out = process_frame(cv2.resize(frame,(ow,oh)), LM, ema, cfg)
+            wrt.write(out); fi += 1
+            el  = time.time()-t0; pf = fi/max(el,1e-3); eta = (tot-fi)/max(pf,1e-3)
+            prog.progress(min(fi/max(tot,1),1.0),
+                         text=f"Frame {fi}/{tot} · {pf:.1f} fps · ETA {eta:.0f}s")
+            if fi % 20 == 0:
+                prev.image(cv2.cvtColor(out,cv2.COLOR_BGR2RGB), use_container_width=True)
+
+        cap.release(); wrt.release(); prog.empty(); prev.empty()
+
+        out264 = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4").name
+        with st.spinner("Re-encoding to H.264…"):
+            _sp.run([FFMPEG,"-y","-i",raw,
+                     "-c:v","libx264","-preset","fast","-crf","22",
+                     "-movflags","+faststart",out264],
+                    capture_output=True, check=False)
+
+        el = time.time()-t0
+        st.success(f"✅ Done — {fi} frames · {el:.1f}s · {fi/el:.1f} fps")
+        vf = out264 if os.path.exists(out264) and os.path.getsize(out264)>1000 else raw
+        with open(vf,"rb") as f:
+            st.download_button("📥 Download Mesh Video", f.read(),
+                               "5region_mesh.mp4","video/mp4", use_container_width=True)
+        for p in [tmp.name, raw]:
+            try: os.unlink(p)
+            except: pass
