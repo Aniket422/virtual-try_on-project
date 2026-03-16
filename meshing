@@ -210,7 +210,18 @@ def delaunay(em,im,extra,h,w,gs):
     cp=[(int(simp[i][0][0]),int(simp[i][0][1])) for i in range(0,len(simp),step)
         if 0<simp[i][0][0]<w and 0<simp[i][0][1]<h]
     mn=im.astype(np.float32)/255
-    ip=[(gx,gy) for gy in range(gs,h-gs,gs) for gx in range(gs,w-gs,gs) if mn[gy,gx]>0.5]
+    ys, xs = np.where(im > 0)
+
+    if len(xs) > 0:
+        xmin, xmax = xs.min(), xs.max()
+        ymin, ymax = ys.min(), ys.max()
+
+        ip = [(gx,gy)
+            for gy in range(ymin, ymax, gs)
+            for gx in range(xmin, xmax, gs)
+            if mn[gy,gx] > 0.5]
+    else:
+        ip = []
     pts=list(set(extra+cp+ip))
     if len(pts)<4: return [],mc
     sd=cv2.Subdiv2D((0,0,w,h))
@@ -224,6 +235,47 @@ def delaunay(em,im,extra,h,w,gs):
             tris.append((int(x1),int(y1),int(x2),int(y2),int(x3),int(y3)))
     return tris,mc
 
+
+def compute_uv(tri, bbox):
+
+    x1,y1,x2,y2,x3,y3 = tri
+    xmin,xmax,ymin,ymax = bbox
+
+    # normalize to 0-1 range
+    u1 = (x1-xmin)/(xmax-xmin+1e-6)
+    v1 = (y1-ymin)/(ymax-ymin+1e-6)
+
+    u2 = (x2-xmin)/(xmax-xmin+1e-6)
+    v2 = (y2-ymin)/(ymax-ymin+1e-6)
+
+    u3 = (x3-xmin)/(xmax-xmin+1e-6)
+    v3 = (y3-ymin)/(ymax-ymin+1e-6)
+
+    return [(u1,v1),(u2,v2),(u3,v3)]
+
+def draw_uv_mesh(canvas, tris, bbox):
+
+    for tri in tris:
+
+        uv = compute_uv(tri, bbox)
+
+        # average UV to color triangle
+        u = (uv[0][0] + uv[1][0] + uv[2][0]) / 3
+        v = (uv[0][1] + uv[1][1] + uv[2][1]) / 3
+
+        color = (
+            int(u*255),
+            int(v*255),
+            150
+        )
+
+        x1,y1,x2,y2,x3,y3 = tri
+
+        pts = np.array([[x1,y1],[x2,y2],[x3,y3]])
+
+        cv2.fillPoly(canvas,[pts],color)
+
+        cv2.polylines(canvas,[pts],True,(0,0,0),1,cv2.LINE_AA)
 def draw_layer(canvas,tris,cnt,color,lt,fa):
     if not tris: return
     ov=canvas.copy(); fc=tuple(max(0,int(c*.07)) for c in color)
@@ -255,18 +307,28 @@ def process_frame(frame,interp,ema_obj,cfg):
     wb_raw=detect_wb(frame,seg_b,sh_y,h,w)
     wb=int(ema_obj.upd("wb",float(wb_raw)))
     (he,hi),(se,si),(pe,pi)=get_masks(frame,lm_s,seg_s,wb,h,w)
+    ys, xs = np.where(si > 0)
+
+    if len(xs) > 0:
+        xmin, xmax = xs.min(), xs.max()
+        ymin, ymax = ys.min(), ys.max()
+    else:
+        xmin, xmax = 0, w
+        ymin, ymax = 0, h
     vs=lm_s[:,3]
     lm_pts=[(int(np.clip(lm_s[i,0]/256*w,0,w-1)),int(np.clip(lm_s[i,1]/256*h,0,h-1)))
             for i in range(39) if vs[i]>0.15
             and 3<lm_s[i,0]/256*w<w-3 and 3<lm_s[i,1]/256*h<h-3]
     def inn(m): return [(x,y) for x,y in lm_pts if 0<=y<h and 0<=x<w and m[y,x]>127]
     gs=cfg["gs"]; lt=cfg["lt"]; canvas=frame.copy()
-    ht,hc=delaunay(he,hi,inn(hi),h,w,gs)
-    st2,sc=delaunay(se,si,inn(si),h,w,gs)
-    pt,pc=delaunay(pe,pi,inn(pi),h,w,gs)
-    draw_layer(canvas,ht,hc,cfg["head"],lt,0.08)
-    draw_layer(canvas,pt,pc,cfg["pants"],lt,0.12)
-    draw_layer(canvas,st2,sc,cfg["shirt"],lt,0.15)
+    shirt_tris, shirt_contour = delaunay(se, si, inn(si), h, w, gs)
+
+# disable normal mesh while debugging UV
+# draw_layer(canvas, shirt_tris, shirt_contour, cfg["shirt"], lt, 0.15)
+
+    bbox = (xmin, xmax, ymin, ymax)
+
+    draw_uv_mesh(canvas, shirt_tris, bbox)
     if cfg["nodes"]:
         for px,py in lm_pts:
             cv2.circle(canvas,(px,py),4,(0,255,180),-1,cv2.LINE_AA)
