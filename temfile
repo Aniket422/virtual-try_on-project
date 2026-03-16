@@ -1,400 +1,379 @@
+"""
+Body Mesh v6 — accurate shape + hole-free interior
+====================================================
+TWO MASKS PER REGION (the key architectural fix):
+
+  edge mask     = actual seg pixels sliced to zone
+                  → correct shape outline (follows shirt curves, armhole notch)
+                  → used for: Delaunay contour points, draw_layer outline
+
+  interior mask = solid row-fill of edge mask
+                  → spans left-to-right between outermost seg pixels per row
+                  → bridges arm/hand gaps so Delaunay grid has no holes
+                  → used for: Delaunay interior grid point test only
+
+Previously the solid fill was used for BOTH outline AND interior,
+causing the mesh to draw a rectangular boundary instead of the shirt shape,
+making it spill outside the actual garment.
+
+Waistband: full-width median saturation scan, largest gradient = shirt/pants boundary.
+Works at all rotation angles (old single-column scan failed at side view).
+
+Run:  streamlit run app.py
+"""
+
+import subprocess, sys, importlib
+
+def _pip(pkg, mod=None):
+    try: importlib.import_module(mod or pkg.replace("-","_").split("[")[0])
+    except ImportError:
+        subprocess.check_call([sys.executable,"-m","pip","install",pkg,"--quiet"],
+                              stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
+
+_pip("opencv-python","cv2"); _pip("numpy"); _pip("requests"); _pip("scipy")
+_pip("tflite-runtime", "tflite_runtime"); _pip("imageio-ffmpeg","imageio_ffmpeg")
+_pip("streamlit")
+
 import streamlit as st
-import cv2
-import numpy as np
-from ultralytics import YOLO
-import tempfile
-from segment_anything import sam_model_registry, SamPredictor
-import torch
-from PIL import Image
-import math
+import cv2, numpy as np, tempfile, os, io, tarfile, time, requests
+import subprocess as _sp, imageio_ffmpeg
+from scipy.ndimage import uniform_filter1d
+from tflite_runtime.interpreter import Interpreter
 
-# ─────────────────────────────────────────────
-#  PAGE CONFIG
-# ─────────────────────────────────────────────
-st.set_page_config(
-    page_title="360° Cloth Transfer",
-    page_icon="👕",
-    layout="wide"
-)
+FFMPEG = imageio_ffmpeg.get_ffmpeg_exe()
 
-# ─────────────────────────────────────────────
-#  CUSTOM CSS
-# ─────────────────────────────────────────────
-st.markdown("""
-<style>
-  body { background: #0f0f0f; }
-  .main { background: #0f0f0f; }
-  .stApp { background: linear-gradient(135deg,#0f0f0f 0%,#1a1a2e 100%); }
-  h1 { 
-    font-family: 'Courier New', monospace;
-    background: linear-gradient(90deg,#00d4ff,#7b2ff7);
-    -webkit-background-clip: text; -webkit-text-fill-color: transparent;
-    font-size: 2.4rem; letter-spacing: 2px;
-  }
-  .info-box {
-    background: rgba(0,212,255,0.08);
-    border: 1px solid rgba(0,212,255,0.3);
-    border-radius: 10px; padding: 16px; margin: 12px 0;
-    font-family: monospace; color: #00d4ff; font-size: 0.85rem;
-  }
-  .angle-indicator {
-    background: rgba(123,47,247,0.15);
-    border: 1px solid rgba(123,47,247,0.4);
-    border-radius: 8px; padding: 10px; text-align: center;
-    font-family: monospace; color: #c084fc; font-size: 1rem;
-  }
-  .stProgress > div > div { background: linear-gradient(90deg,#00d4ff,#7b2ff7) !important; }
-</style>
-""", unsafe_allow_html=True)
+st.set_page_config(page_title="Body Mesh v6", page_icon="🔬", layout="centered")
+st.title("🔬 Body Mesh v6")
+st.markdown("🔴 **Shirt** · 🔵 **Pants** · 🟡 **Head/cap** — accurate shape, no spill")
+st.divider()
 
-st.markdown("# 👕 360° Angle-Aware Clothing Transfer")
-st.markdown("""
-<div class='info-box'>
-  ● Upload a <b>product sheet</b> with 4 views: front-left · side · back · side-right<br>
-  ● The app auto-detects person orientation (−45° → 0° → +45°) and picks the correct shirt view<br>
-  ● Uses YOLO-seg + SAM for pixel-perfect segmentation with sharp edges
-</div>
-""", unsafe_allow_html=True)
+MODEL_DIR = os.path.join(tempfile.gettempdir(),"blazepose_models")
+NPM_URL   = "https://registry.npmjs.org/@mediapipe/pose/-/pose-0.5.1675469404.tgz"
 
-# ─────────────────────────────────────────────
-#  LOAD MODELS
-# ─────────────────────────────────────────────
-@st.cache_resource
-def load_models():
-    model = YOLO("deepfashion2_yolov8s-seg.pt")
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    sam = sam_model_registry["vit_b"](checkpoint="sam_vit_b_01ec64.pth")
-    sam.to(device)
-    predictor = SamPredictor(sam)
-    return model, predictor, device
+@st.cache_resource(show_spinner=False)
+def load_model():
+    os.makedirs(MODEL_DIR,exist_ok=True)
+    p=os.path.join(MODEL_DIR,"pose_landmark_heavy.tflite")
+    if not os.path.exists(p):
+        with st.spinner("⬇️ Downloading BlazePose (~28 MB)…"):
+            r=requests.get(NPM_URL,timeout=300); r.raise_for_status()
+            with tarfile.open(fileobj=io.BytesIO(r.content)) as t:
+                data=t.extractfile("package/pose_landmark_heavy.tflite").read()
+            open(p,"wb").write(data)
+    interp=Interpreter(model_path=p); interp.allocate_tensors()
+    return interp
 
-try:
-    model, predictor, device = load_models()
-    st.success(f"✅ Models loaded — running on **{device.upper()}**")
-except Exception as e:
-    st.error(f"⚠️ Model load failed: {e}")
-    st.stop()
+with st.spinner("Loading BlazePose…"): INTERP=load_model()
+st.success("✅ Ready"); st.divider()
 
-# ─────────────────────────────────────────────
-#  HELPERS
-# ─────────────────────────────────────────────
+st.subheader("⚙️ Settings")
+c1,c2=st.columns(2)
+with c1:
+    shirt_hex=st.color_picker("🔴 Shirt","#FF3C00")
+    pants_hex=st.color_picker("🔵 Pants","#1050FF")
+    head_hex =st.color_picker("🟡 Head", "#FFE000")
+with c2:
+    grid_step   =st.slider("Mesh density (lower=denser)",16,56,22)
+    line_thick  =st.slider("Line thickness",1,3,1)
+    smooth_alpha=st.slider("EMA smoothing",0.10,0.55,0.25,step=0.05)
+    show_nodes  =st.checkbox("Show landmark nodes",True)
+    output_w    =st.selectbox("Output width (px)",[540,720,1080])
+st.divider()
 
-def extract_cloth_region(img_bgr: np.ndarray, mask: np.ndarray, box_xyxy) -> np.ndarray:
-    """Crop shirt from source image using mask + bounding box, inpaint holes."""
-    x1, y1, x2, y2 = map(int, box_xyxy)
-    cloth = img_bgr.copy()
-    cloth[mask == 0] = 0
-    crop = cloth[y1:y2, x1:x2]
-    if crop.size == 0:
-        return None
-    hole_mask = (crop.sum(axis=-1) == 0).astype(np.uint8) * 255
-    crop = cv2.inpaint(crop, hole_mask, 3, cv2.INPAINT_TELEA)
-    return crop
+st.subheader("📹 Upload Video")
+uploaded=st.file_uploader("Upload a video of a person rotating",type=["mp4","avi","mov","mkv"])
 
+def hex_bgr(h):
+    h=h.lstrip("#"); return (int(h[4:6],16),int(h[2:4],16),int(h[0:2],16))
 
-def estimate_body_angle(box_xyxy, frame_w: int) -> float:
+class EMA:
+    def __init__(self,alpha=0.25): self.a=alpha; self.s={}
+    def reset(self): self.s={}
+    def upd(self,k,v):
+        if k not in self.s: self.s[k]=v.copy() if hasattr(v,"copy") else float(v)
+        else:
+            if hasattr(v,"copy"): self.s[k]=self.a*v+(1-self.a)*self.s[k]
+            else: self.s[k]=self.a*float(v)+(1-self.a)*self.s[k]
+        return self.s[k]
+
+def detect_wb(frame,seg_bin,sh_y,h,w):
+    """Scan full body width per row. Median sat. Largest gradient = shirt→pants."""
+    ry,sats=[],[]
+    for y in range(sh_y,h-10):
+        row=seg_bin[y,:]; nz=np.where(row>0)[0]
+        if len(nz)<20: continue
+        strip=frame[y,int(nz[0]):int(nz[-1])]
+        if len(strip)<10: continue
+        hsv=cv2.cvtColor(strip.reshape(1,-1,3),cv2.COLOR_BGR2HSV)[0]
+        ry.append(y); sats.append(float(np.median(hsv[:,1])))
+    if len(ry)<30: return sh_y+int(h*0.4)
+    ry_a=np.array(ry); ss=uniform_filter1d(np.array(sats),25)
+    return int(ry_a[int(np.argmax(np.diff(ss)))])
+
+def zone_masks(seg_bin,y_top,y_bot,h,w):
     """
-    Estimate rough horizontal orientation from bounding-box position & aspect.
-    Returns angle in degrees:
-      0   = facing camera (front view)
-     -45  = turned left  (show left-side view)
-     +45  = turned right (show right-side view)
+    Returns (edge, interior):
+      edge     = seg pixels within y_top..y_bot  — accurate outline
+      interior = solid row-fill of edge           — no holes for Delaunay
     """
-    x1, y1, x2, y2 = box_xyxy
-    cx = (x1 + x2) / 2
-    w  = x2 - x1
-    h  = y2 - y1
-    aspect = w / max(h, 1)          # narrow → side-on; wide → frontal
+    edge=seg_bin.copy(); edge[:y_top,:]=0; edge[y_bot:,:]=0
+    interior=np.zeros((h,w),np.uint8)
+    for y in range(max(0,y_top),min(y_bot,h)):
+        nz=np.where(edge[y,:]>0)[0]
+        if len(nz)<5: continue
+        interior[y,int(nz[0]):int(nz[-1])+1]=255
+    interior=cv2.morphologyEx(interior,cv2.MORPH_CLOSE,np.ones((7,7),np.uint8))
+    return edge, interior
 
-    # Map aspect ratio: ~0.35 side-on → ±45°; ~0.55 frontal → 0°
-    # Normalise to [-45, 45] based on aspect
-    angle_from_aspect = (0.55 - aspect) / 0.20 * 45.0
-    angle_from_aspect = float(np.clip(angle_from_aspect, -45, 45))
-
-    # Use horizontal position to decide left vs right lean
-    rel_x = (cx / frame_w) - 0.5    # -0.5 left ... +0.5 right
-    angle = angle_from_aspect * np.sign(rel_x) if abs(rel_x) > 0.1 else angle_from_aspect
-    return float(angle)
+def cc_seed(zone,sx,sy,h,w):
+    sx,sy=int(np.clip(sx,1,w-2)),int(np.clip(sy,1,h-2))
+    if zone.sum()==0: return np.zeros((h,w),np.uint8)
+    _,lbl,stats,_=cv2.connectedComponentsWithStats(zone)
+    l=int(lbl[sy,sx])
+    if l>0: return (lbl==l).astype(np.uint8)*255
+    return (lbl==int(np.argmax(stats[1:,cv2.CC_STAT_AREA])+1)).astype(np.uint8)*255
 
 
-def angle_to_view_index(angle_deg: float) -> int:
-    """
-    Map body angle to one of 4 shirt-view slots:
-      0 = front   ( -15° .. +15°  )
-      1 = left-side ( < -15° )
-      2 = back    ( extreme — not typical in video; fallback )
-      3 = right-side ( > +15° )
-    Returns index 0-3 matching the 4 crops you extracted.
-    """
-    if angle_deg < -15:
-        return 1   # left / side-left
-    elif angle_deg > 15:
-        return 3   # right / side-right
+def get_masks(frame, lm, seg_up, wb, h, w):
+    vis = lm[:, 3]
+    def ly(i, fb): return int(lm[i, 1] / 256 * h) if vis[i] > 0.15 else fb
+    def lx(i, fb): return int(lm[i, 0] / 256 * w) if vis[i] > 0.15 else fb
+
+    # --- Head landmarks for skin sampling ---
+    nose_x, nose_y = lx(0, w//2), ly(0, int(h*.15))
+    eye_ys = [ly(i, 0) for i in range(1, 7) if vis[i] > 0.15]
+    eye_min = min(eye_ys) if eye_ys else nose_y
+
+    # --- Neck estimate (unchanged) ---
+    sh_y = min(ly(11, int(h*.38)), ly(12, int(h*.38)))
+    mouth_y = (ly(9,0)+ly(10,0))//2 if vis[9]>0.15 and vis[10]>0.15 else None
+    neck_y = int(mouth_y + (sh_y - mouth_y) * 0.55) if mouth_y else sh_y - int(h*.04)
+    neck_y = max(0, min(neck_y, sh_y))
+
+    # --- Hip Y (for pants top) ---
+    hip_y = max(ly(23, h//2), ly(24, h//2)) if (vis[23]>0.15 or vis[24]>0.15) else wb
+
+    # --- Bottom of pants (using knees/ankles) ---
+    kn_y = max(ly(25,0), ly(26,0)) if (vis[25]>0.15 or vis[26]>0.15) else 0
+    an_y = max(ly(27,0), ly(28,0)) if (vis[27]>0.15 or vis[28]>0.15) else 0
+    sr = np.where(seg_up.sum(axis=1) > 0)[0]
+    sb = int(sr[-1]) if len(sr) else h-1
+    pb = max(kn_y, an_y, sb) if (kn_y or an_y) else sb
+
+    # --- Prepare binary segmentation ---
+    seg_bin = (seg_up > 0.5).astype(np.uint8) * 255
+    seg_bin = cv2.morphologyEx(seg_bin, cv2.MORPH_CLOSE, np.ones((9,9), np.uint8))
+
+    # --- Skin mask (whole frame) ---
+    # Sample from face/neck area (around nose)
+    roi = frame[max(0, nose_y-30):min(h, nose_y+15),
+                max(0, nose_x-20):min(w, nose_x+20)]
+    if roi.size > 100:
+        hsv_roi = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
+        h_med = np.median(hsv_roi[:,:,0])
+        s_med = np.median(hsv_roi[:,:,1])
+        v_med = np.median(hsv_roi[:,:,2])
+        lower_skin = np.array([max(0, h_med-15), max(5, s_med-60), max(40, v_med-100)], np.uint8)
+        upper_skin = np.array([min(179, h_med+15), min(255, s_med+100), min(255, v_med+80)], np.uint8)
     else:
-        return 0   # front
+        lower_skin = np.array([0, 15, 60], np.uint8)
+        upper_skin = np.array([25, 180, 255], np.uint8)
+
+    skin_mask = cv2.inRange(cv2.cvtColor(frame, cv2.COLOR_BGR2HSV), lower_skin, upper_skin)
+    skin_mask = cv2.morphologyEx(skin_mask, cv2.MORPH_CLOSE, np.ones((9,9), np.uint8))
+    not_skin = cv2.bitwise_not(skin_mask)
+
+    # --- Head mask (above eyes) ---
+    hz = seg_bin.copy()
+    hz[eye_min:, :] = 0
+    head_e = cc_seed(hz, nose_x, max(10, eye_min-30), h, w)
+    head_e = cv2.bitwise_and(head_e, not_skin)          # remove skin
+    head_i = head_e.copy()                               # interior = edge (head is small)
+
+    # --- Shirt mask (neck → waistband) ---
+    shirt_e, shirt_i = zone_masks(seg_bin, neck_y, wb+5, h, w)
+    shirt_e = cv2.bitwise_and(cv2.subtract(shirt_e, head_e), not_skin)
+    shirt_i = cv2.bitwise_and(cv2.subtract(shirt_i, head_e), not_skin)
+
+    # --- Pants mask (below hips → bottom) ---
+    pants_top = max(wb-5, hip_y)                         # ensure below hips
+    pants_e, pants_i = zone_masks(seg_bin, pants_top, pb+int(h*.02), h, w)
+    pants_e = cv2.bitwise_and(cv2.subtract(pants_e, cv2.bitwise_or(head_e, shirt_e)), not_skin)
+    pants_i = cv2.bitwise_and(cv2.subtract(pants_i, cv2.bitwise_or(head_i, shirt_i)), not_skin)
+
+    return (head_e, head_i), (shirt_e, shirt_i), (pants_e, pants_i)
 
 
-def split_product_sheet(img_bgr: np.ndarray, n_views: int = 4):
-    """Split a horizontally-arranged product sheet into N equal vertical strips."""
-    h, w = img_bgr.shape[:2]
-    strip_w = w // n_views
-    views = []
-    for i in range(n_views):
-        crop = img_bgr[:, i * strip_w : (i + 1) * strip_w]
-        views.append(crop)
-    return views   # [front-left, side-left, back, side-right]  (typical layout)
+def delaunay(em,im,extra,h,w,gs):
+    cs,_=cv2.findContours(em,cv2.RETR_EXTERNAL,cv2.CHAIN_APPROX_NONE)
+    if not cs: return [],None
+    mc=max(cs,key=cv2.contourArea)
+    simp=cv2.approxPolyDP(mc,3,True); step=max(1,len(simp)//60)
+    cp=[(int(simp[i][0][0]),int(simp[i][0][1])) for i in range(0,len(simp),step)
+        if 0<simp[i][0][0]<w and 0<simp[i][0][1]<h]
+    mn=im.astype(np.float32)/255
+    ys, xs = np.where(im > 0)
+
+    if len(xs) > 0:
+        xmin, xmax = xs.min(), xs.max()
+        ymin, ymax = ys.min(), ys.max()
+
+        ip = [(gx,gy)
+            for gy in range(ymin, ymax, gs)
+            for gx in range(xmin, xmax, gs)
+            if mn[gy,gx] > 0.5]
+    else:
+        ip = []
+    pts=list(set(extra+cp+ip))
+    if len(pts)<4: return [],mc
+    sd=cv2.Subdiv2D((0,0,w,h))
+    for p in pts: 
+        try: sd.insert(p)
+        except: pass
+    tris=[]
+    for x1,y1,x2,y2,x3,y3 in sd.getTriangleList():
+        ccx=(int(x1)+int(x2)+int(x3))//3; ccy=(int(y1)+int(y2)+int(y3))//3
+        if 0<ccx<w and 0<ccy<h and mn[ccy,ccx]>0.35:
+            tris.append((int(x1),int(y1),int(x2),int(y2),int(x3),int(y3)))
+    return tris,mc
 
 
-def apply_shirt_to_frame(
-    frame: np.ndarray,
-    predictor,
-    model,
-    shirt_views: list,
-    conf: float = 0.45,
-) -> tuple:
-    """Run detection + SAM on one frame, pick angle-correct shirt, blend."""
-    output = frame.copy()
-    used_angle = 0.0
-    used_view_idx = 0
-    frame_h, frame_w = frame.shape[:2]
+def compute_uv(tri, bbox):
 
-    results = model(frame, conf=conf, verbose=False)
-    if results[0].boxes is None:
-        return output, used_angle, used_view_idx
+    x1,y1,x2,y2,x3,y3 = tri
+    xmin,xmax,ymin,ymax = bbox
 
-    frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-    predictor.set_image(frame_rgb)
+    # normalize to 0-1 range
+    u1 = (x1-xmin)/(xmax-xmin+1e-6)
+    v1 = (y1-ymin)/(ymax-ymin+1e-6)
 
-    for box in results[0].boxes:
-        cls = int(box.cls[0])
-        if cls not in [0, 1]:          # 0=short-sleeve, 1=long-sleeve
-            continue
+    u2 = (x2-xmin)/(xmax-xmin+1e-6)
+    v2 = (y2-ymin)/(ymax-ymin+1e-6)
 
-        x1, y1, x2, y2 = map(int, box.xyxy[0])
-        input_box = np.array([x1, y1, x2, y2])
+    u3 = (x3-xmin)/(xmax-xmin+1e-6)
+    v3 = (y3-ymin)/(ymax-ymin+1e-6)
 
-        masks_sam, _, _ = predictor.predict(
-            box=input_box,
-            multimask_output=False
-        )
-        mask = (masks_sam[0] > 0.5).astype(np.uint8) * 255
+    return [(u1,v1),(u2,v2),(u3,v3)]
 
-        # Morphological cleanup for sharp edges
-        k5 = np.ones((5, 5), np.uint8)
-        k3 = np.ones((3, 3), np.uint8)
-        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, k5)
-        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN,  k3)
+def draw_uv_mesh(canvas, tris, bbox):
 
-        # Angle → view
-        used_angle = estimate_body_angle((x1, y1, x2, y2), frame_w)
-        used_view_idx = angle_to_view_index(used_angle)
-        source_cloth = shirt_views[used_view_idx]
+    for tri in tris:
 
-        bw = x2 - x1
-        bh = y2 - y1
-        if bw <= 0 or bh <= 0:
-            continue
+        uv = compute_uv(tri, bbox)
 
-        cloth_resized  = cv2.resize(source_cloth, (bw, bh))
-        mask_crop      = mask[y1:y2, x1:x2]
-        mask_crop      = cv2.resize(mask_crop, (bw, bh), interpolation=cv2.INTER_NEAREST)
+        # average UV to color triangle
+        u = (uv[0][0] + uv[1][0] + uv[2][0]) / 3
+        v = (uv[0][1] + uv[1][1] + uv[2][1]) / 3
 
-        # Alpha blend
-        alpha = mask_crop.astype(np.float32) / 255.0
-        alpha = alpha[..., np.newaxis]
-        roi   = output[y1:y2, x1:x2]
-        blended = (roi * (1 - alpha) + cloth_resized * alpha).astype(np.uint8)
-        output[y1:y2, x1:x2] = blended
-        break   # one person per frame assumed
-
-    return output, used_angle, used_view_idx
-
-
-# ─────────────────────────────────────────────
-#  UI  COLUMNS
-# ─────────────────────────────────────────────
-col_left, col_right = st.columns([1, 1], gap="large")
-
-with col_left:
-    st.subheader("📸 Product Sheet (4-view)")
-    st.caption("Upload the horizontal product image showing: front · side · back · side")
-    source_file = st.file_uploader("Product Image", type=["jpg", "jpeg", "png"], key="src")
-
-with col_right:
-    st.subheader("🎬 Video")
-    st.caption("Upload the video of the person to transfer the shirt onto")
-    video_file = st.file_uploader("Video File", type=["mp4", "mov", "avi"], key="vid")
-
-# ─────────────────────────────────────────────
-#  EXTRACT SHIRT VIEWS FROM PRODUCT SHEET
-# ─────────────────────────────────────────────
-shirt_views = []
-
-if source_file:
-    file_bytes = np.asarray(bytearray(source_file.read()), dtype=np.uint8)
-    product_img = cv2.imdecode(file_bytes, cv2.IMREAD_COLOR)
-
-    # Show uploaded product
-    st.image(cv2.cvtColor(product_img, cv2.COLOR_BGR2RGB),
-             caption="Uploaded product sheet", use_column_width=True)
-
-    # Split into 4 views
-    raw_views = split_product_sheet(product_img, n_views=4)
-    view_labels = ["Front", "Left Side", "Back", "Right Side"]
-
-    st.markdown("### Detected views")
-    vcols = st.columns(4)
-    for i, (v, lbl) in enumerate(zip(raw_views, view_labels)):
-        with vcols[i]:
-            st.image(cv2.cvtColor(v, cv2.COLOR_BGR2RGB), caption=lbl, use_column_width=True)
-
-    # Extract shirt from each view using YOLO
-    for i, view in enumerate(raw_views):
-        results_src = model(view, conf=0.4, verbose=False)
-        extracted = None
-        if results_src[0].masks is not None:
-            for mask_data, box in zip(
-                results_src[0].masks.data.cpu().numpy(),
-                results_src[0].boxes
-            ):
-                cls = int(box.cls[0])
-                if cls not in [0, 1]:
-                    continue
-                m = (mask_data > 0.5).astype(np.uint8)
-                m = cv2.resize(m, (view.shape[1], view.shape[0]),
-                               interpolation=cv2.INTER_NEAREST)
-                extracted = extract_cloth_region(view, m, box.xyxy[0].cpu().numpy())
-                if extracted is not None and extracted.size > 0:
-                    break
-
-        if extracted is None:
-            # Fallback: use full cropped view
-            extracted = view.copy()
-            st.warning(f"⚠️ Auto-extract failed for **{view_labels[i]}** — using full crop as fallback.")
-
-        shirt_views.append(extracted)
-
-    st.success(f"✅ {len(shirt_views)} shirt views ready!")
-
-# ─────────────────────────────────────────────
-#  SETTINGS
-# ─────────────────────────────────────────────
-with st.expander("⚙️ Advanced settings", expanded=False):
-    conf_thresh    = st.slider("Detection confidence", 0.3, 0.9, 0.45, 0.05)
-    angle_display  = st.checkbox("Overlay angle debug text on frames", value=True)
-    max_frames     = st.number_input(
-        "Max frames to process (0 = all)", min_value=0, value=0, step=50
-    )
-
-# ─────────────────────────────────────────────
-#  PROCESS VIDEO
-# ─────────────────────────────────────────────
-if video_file and shirt_views and st.button("🚀 Transfer Shirt to Video", type="primary"):
-
-    tfile = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4")
-    tfile.write(video_file.read())
-    tfile.flush()
-
-    cap     = cv2.VideoCapture(tfile.name)
-    width   = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-    height  = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-    fps     = int(cap.get(cv2.CAP_PROP_FPS)) or 25
-    total   = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-    limit   = int(max_frames) if max_frames > 0 else total
-
-    out_tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4")
-    out     = cv2.VideoWriter(
-        out_tmp.name,
-        cv2.VideoWriter_fourcc(*"mp4v"),
-        fps,
-        (width, height)
-    )
-
-    progress_bar  = st.progress(0.0)
-    status_text   = st.empty()
-    angle_display_box = st.empty()
-
-    view_labels   = ["Front", "Left Side", "Back", "Right Side"]
-    frame_count   = 0
-
-    while frame_count < limit:
-        ret, frame = cap.read()
-        if not ret:
-            break
-
-        processed, angle, view_idx = apply_shirt_to_frame(
-            frame, predictor, model, shirt_views, conf=conf_thresh
+        color = (
+            int(u*255),
+            int(v*255),
+            150
         )
 
-        if angle_display:
-            label = f"Angle:{angle:+.1f}deg | View:{view_labels[view_idx]}"
-            cv2.putText(processed, label, (12, 36),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 220, 255), 2, cv2.LINE_AA)
+        x1,y1,x2,y2,x3,y3 = tri
 
-        out.write(processed)
-        frame_count += 1
-        pct = frame_count / limit
-        progress_bar.progress(min(pct, 1.0))
-        status_text.markdown(
-            f"Frame **{frame_count}/{limit}** — "
-            f"Angle: `{angle:+.1f}°` → **{view_labels[view_idx]}** view"
-        )
+        pts = np.array([[x1,y1],[x2,y2],[x3,y3]])
 
-    cap.release()
-    out.release()
+        cv2.fillPoly(canvas,[pts],color)
 
-    st.success("✅ Processing complete!")
+        cv2.polylines(canvas,[pts],True,(0,0,0),1,cv2.LINE_AA)
+def draw_layer(canvas,tris,cnt,color,lt,fa):
+    if not tris: return
+    ov=canvas.copy(); fc=tuple(max(0,int(c*.07)) for c in color)
+    for x1,y1,x2,y2,x3,y3 in tris:
+        cv2.fillPoly(ov,[np.array([[x1,y1],[x2,y2],[x3,y3]])],fc)
+    canvas[:]=cv2.addWeighted(canvas,1-fa,ov,fa,0)
+    for x1,y1,x2,y2,x3,y3 in tris:
+        cv2.polylines(canvas,[np.array([[x1,y1],[x2,y2],[x3,y3]])],True,color,lt,cv2.LINE_AA)
+    if cnt is not None: cv2.drawContours(canvas,[cnt],-1,color,2,cv2.LINE_AA)
 
-    with open(out_tmp.name, "rb") as f:
-        video_bytes = f.read()
+def process_frame(frame,interp,ema_obj,cfg):
+    h,w=frame.shape[:2]
+    inp=cv2.cvtColor(cv2.resize(frame,(256,256)),cv2.COLOR_BGR2RGB).astype(np.float32)/255
+    interp.set_tensor(interp.get_input_details()[0]["index"],inp[np.newaxis])
+    interp.invoke()
+    lm=interp.get_tensor(696)[0].reshape(39,5).copy()
+    seg=interp.get_tensor(565)[0,:,:,0]
+    prs=float(interp.get_tensor(701)[0,0])
+    lm[:,3]=1/(1+np.exp(-lm[:,3])); lm[:,4]=1/(1+np.exp(-lm[:,4]))
+    seg_up=cv2.resize(1/(1+np.exp(-seg)),(w,h))
+    if not (prs>0.3 or np.mean(lm[:,3][:17])>0.3):
+        ema_obj.reset(); return frame
+    lm_s=ema_obj.upd("lm",lm); seg_s=ema_obj.upd("seg",seg_up)
+    seg_s = cv2.GaussianBlur(seg_s, (7,7), 0)
+    seg_s = np.clip(seg_s, 0.0, 1.0)
+    vis=lm_s[:,3]
+    def ly(i,fb): return int(lm_s[i,1]/256*h) if vis[i]>0.15 else fb
+    sh_y=min(ly(11,int(h*.38)),ly(12,int(h*.38)))
+    seg_b=(seg_s>0.5).astype(np.uint8)*255
+    seg_b=cv2.morphologyEx(seg_b,cv2.MORPH_CLOSE,np.ones((9,9),np.uint8))
+    wb_raw=detect_wb(frame,seg_b,sh_y,h,w)
+    wb=int(ema_obj.upd("wb",float(wb_raw)))
+    (he,hi),(se,si),(pe,pi)=get_masks(frame,lm_s,seg_s,wb,h,w)
+    ys, xs = np.where(si > 0)
 
-    st.download_button(
-        label="⬇️ Download result video",
-        data=video_bytes,
-        file_name="shirt_transfer_output.mp4",
-        mime="video/mp4",
-    )
+    if len(xs) > 0:
+        xmin, xmax = xs.min(), xs.max()
+        ymin, ymax = ys.min(), ys.max()
+    else:
+        xmin, xmax = 0, w
+        ymin, ymax = 0, h
+    vs=lm_s[:,3]
+    lm_pts=[(int(np.clip(lm_s[i,0]/256*w,0,w-1)),int(np.clip(lm_s[i,1]/256*h,0,h-1)))
+            for i in range(39) if vs[i]>0.15
+            and 3<lm_s[i,0]/256*w<w-3 and 3<lm_s[i,1]/256*h<h-3]
+    def inn(m): return [(x,y) for x,y in lm_pts if 0<=y<h and 0<=x<w and m[y,x]>127]
+    gs=cfg["gs"]; lt=cfg["lt"]; canvas=frame.copy()
+    shirt_tris, shirt_contour = delaunay(se, si, inn(si), h, w, gs)
 
-    # Quick preview (first frame)
-    cap_preview = cv2.VideoCapture(out_tmp.name)
-    ret, preview_frame = cap_preview.read()
-    cap_preview.release()
-    if ret:
-        st.image(
-            cv2.cvtColor(preview_frame, cv2.COLOR_BGR2RGB),
-            caption="Preview — first frame of result",
-            use_column_width=True
-        )
+# disable normal mesh while debugging UV
+# draw_layer(canvas, shirt_tris, shirt_contour, cfg["shirt"], lt, 0.15)
 
-elif video_file and not shirt_views:
-    st.info("⬆️ Upload the product sheet first to extract shirt views.")
+    bbox = (xmin, xmax, ymin, ymax)
 
-elif not video_file and shirt_views:
-    st.info("⬆️ Upload a video to start processing.")
+    draw_uv_mesh(canvas, shirt_tris, bbox)
+    if cfg["nodes"]:
+        for px,py in lm_pts:
+            cv2.circle(canvas,(px,py),4,(0,255,180),-1,cv2.LINE_AA)
+            cv2.circle(canvas,(px,py),2,(255,255,255),-1,cv2.LINE_AA)
+    return canvas
 
-# ─────────────────────────────────────────────
-#  HOW IT WORKS
-# ─────────────────────────────────────────────
-with st.expander("📖 How the angle detection works", expanded=False):
-    st.markdown("""
-    **Angle estimation (no extra pose model needed):**
-
-    | Body angle | Bounding-box aspect ratio | Chosen shirt view |
-    |---|---|---|
-    | −45° (left turn) | narrow (~0.35) | Left-side image |
-    | 0°  (facing cam) | wide   (~0.55) | Front image     |
-    | +45° (right turn)| narrow (~0.35) | Right-side image|
-
-    The horizontal center of the box relative to the frame width
-    breaks the left/right symmetry.
-
-    **Pipeline per frame:**
-    1. YOLOv8-seg detects shirt bounding box + coarse mask
-    2. SAM refines to a pixel-accurate mask
-    3. Morphological ops (close + open) sharpen edges
-    4. Angle estimated → correct shirt view selected
-    5. Alpha-blend: original pixels outside mask, shirt inside
-
-    For even better accuracy you can plug in a **pose estimator**
-    (e.g. MediaPipe Pose) to get the exact shoulder angle.
-    """)
+if uploaded:
+    st.video(uploaded)
+    if st.button("▶️ Generate Mesh Video",type="primary",use_container_width=True):
+        cfg=dict(shirt=hex_bgr(shirt_hex),pants=hex_bgr(pants_hex),
+                 head=hex_bgr(head_hex),gs=grid_step,lt=line_thick,nodes=show_nodes)
+        tmp=tempfile.NamedTemporaryFile(delete=False,suffix=".mp4")
+        tmp.write(uploaded.read()); tmp.close()
+        cap=cv2.VideoCapture(tmp.name)
+        fps=cap.get(cv2.CAP_PROP_FPS) or 25
+        ow_=int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)); oh_=int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        tot=int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        sc=output_w/max(ow_,1); ow=output_w; oh=int(oh_*sc)&~1
+        raw=tempfile.NamedTemporaryFile(delete=False,suffix=".mp4").name
+        wrt=cv2.VideoWriter(raw,cv2.VideoWriter_fourcc(*"mp4v"),fps,(ow,oh))
+        ema_obj=EMA(alpha=smooth_alpha)
+        prog=st.progress(0,"Starting…"); prev=st.empty()
+        t0=time.time(); fi=0
+        while True:
+            ret,frame=cap.read()
+            if not ret: break
+            out=process_frame(cv2.resize(frame,(ow,oh)),INTERP,ema_obj,cfg)
+            wrt.write(out); fi+=1
+            el=time.time()-t0; pf=fi/max(el,1e-3); eta=(tot-fi)/max(pf,1e-3)
+            prog.progress(min(fi/max(tot,1),1.0),text=f"Frame {fi}/{tot} · {pf:.1f} fps · ETA {eta:.0f}s")
+            if fi%20==0: prev.image(cv2.cvtColor(out,cv2.COLOR_BGR2RGB),use_container_width=True)
+        cap.release(); wrt.release(); prog.empty(); prev.empty()
+        out264=tempfile.NamedTemporaryFile(delete=False,suffix=".mp4").name
+        with st.spinner("Re-encoding…"):
+            _sp.run([FFMPEG,"-y","-i",raw,"-c:v","libx264","-preset","fast",
+                     "-crf","22","-movflags","+faststart",out264],capture_output=True,check=False)
+        el=time.time()-t0
+        st.success(f"✅ Done — {fi} frames · {el:.1f}s · {fi/el:.1f} fps")
+        vf=out264 if os.path.exists(out264) and os.path.getsize(out264)>1000 else raw
+        with open(vf,"rb") as f:
+            st.download_button("📥 Download",f.read(),"mesh_v6.mp4","video/mp4",use_container_width=True)
+        for p in [tmp.name,raw]:
+            try: os.unlink(p)
+            except: pass
