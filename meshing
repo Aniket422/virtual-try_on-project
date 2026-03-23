@@ -133,6 +133,7 @@ def cc_seed(zone,sx,sy,h,w):
     if l>0: return (lbl==l).astype(np.uint8)*255
     return (lbl==int(np.argmax(stats[1:,cv2.CC_STAT_AREA])+1)).astype(np.uint8)*255
 
+
 def get_masks(frame, lm, seg_up, wb, h, w):
     vis = lm[:, 3]
     def ly(i, fb): return int(lm[i, 1] / 256 * h) if vis[i] > 0.15 else fb
@@ -201,6 +202,7 @@ def get_masks(frame, lm, seg_up, wb, h, w):
     pants_i = cv2.bitwise_and(cv2.subtract(pants_i, cv2.bitwise_or(head_i, shirt_i)), not_skin)
 
     return (head_e, head_i), (shirt_e, shirt_i), (pants_e, pants_i)
+
 
 def delaunay(em,im,extra,h,w,gs):
     cs,_=cv2.findContours(em,cv2.RETR_EXTERNAL,cv2.CHAIN_APPROX_NONE)
@@ -299,6 +301,8 @@ def process_frame(frame,interp,ema_obj,cfg):
     if not (prs>0.3 or np.mean(lm[:,3][:17])>0.3):
         ema_obj.reset(); return frame
     lm_s=ema_obj.upd("lm",lm); seg_s=ema_obj.upd("seg",seg_up)
+    seg_s = cv2.GaussianBlur(seg_s, (7,7), 0)
+    seg_s = np.clip(seg_s, 0.0, 1.0)
     vis=lm_s[:,3]
     def ly(i,fb): return int(lm_s[i,1]/256*h) if vis[i]>0.15 else fb
     sh_y=min(ly(11,int(h*.38)),ly(12,int(h*.38)))
